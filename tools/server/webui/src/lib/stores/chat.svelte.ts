@@ -622,7 +622,6 @@ class ChatStore {
 					await conversationsStore.updateCurrentNode(assistantMessage.id);
 
 					if (onComplete) await onComplete(streamedContent);
-					this.setChatLoading(assistantMessage.convId, false);
 					this.clearChatStreaming(assistantMessage.convId);
 					this.clearProcessingState(assistantMessage.convId);
 
@@ -632,12 +631,20 @@ class ChatStore {
 
 					// If the model emitted tool calls, execute any enabled tools and continue the exchange.
 					if (finalToolCalls) {
-						await this.processToolCallsAndContinue(
+						const continued = await this.processToolCallsAndContinue(
 							finalToolCalls,
 							assistantMessage,
 							modelOverride || null
 						);
+						// Keep the chat "loading" state continuous across tool execution + follow-up generation.
+						// If we didn't actually continue, make sure we clear the loading state now.
+						if (!continued) {
+							this.setChatLoading(assistantMessage.convId, false);
+						}
+						return;
 					}
+
+					this.setChatLoading(assistantMessage.convId, false);
 				},
 				onError: (error: Error) => {
 					this.stopStreaming();
@@ -1408,7 +1415,7 @@ class ChatStore {
 		toolCallContent: string,
 		sourceAssistant: DatabaseMessage,
 		modelOverride?: string | null
-	): Promise<void> {
+	): Promise<boolean> {
 		const currentConfig = config();
 
 		let toolCalls: ApiChatCompletionToolCall[] = [];
@@ -1419,17 +1426,17 @@ class ChatStore {
 			}
 		} catch (error) {
 			console.warn('Failed to parse tool calls', error);
-			return;
+			return false;
 		}
 
 		const relevantCalls = toolCalls.filter((call) => {
 			const fnName = call.function?.name;
 			return Boolean(fnName && call.id && isToolEnabled(fnName, currentConfig));
 		});
-		if (relevantCalls.length === 0) return;
+		if (relevantCalls.length === 0) return false;
 
 		const activeConv = conversationsStore.activeConversation;
-		if (!activeConv) return;
+		if (!activeConv) return false;
 
 		const toolMessages: DatabaseMessage[] = [];
 
@@ -1462,13 +1469,13 @@ class ChatStore {
 			}
 		}
 
-		if (toolMessages.length === 0) return;
+		if (toolMessages.length === 0) return false;
 
 		// Create a new assistant message to continue the conversation
 		const newAssistant = await this.createAssistantMessage(
 			toolMessages[toolMessages.length - 1]?.id || sourceAssistant.id
 		);
-		if (!newAssistant) return;
+		if (!newAssistant) return false;
 
 		conversationsStore.addMessageToActive(newAssistant);
 		this.setChatLoading(activeConv.id, true);
@@ -1481,6 +1488,8 @@ class ChatStore {
 			undefined,
 			modelOverride || null
 		);
+
+		return true;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────
