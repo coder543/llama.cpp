@@ -119,6 +119,7 @@ export class ChatService {
 			messages: normalizedMessages.map((msg: ApiChatMessageData) => ({
 				role: msg.role,
 				content: msg.content,
+				...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
 				...((msg as ApiChatCompletionRequestMessage).tool_call_id
 					? { tool_call_id: (msg as ApiChatCompletionRequestMessage).tool_call_id }
 					: {}),
@@ -602,6 +603,9 @@ export class ChatService {
 			return {
 				role: message.role as ChatRole,
 				content: message.content,
+				...(message.role === 'assistant' && message.thinking
+					? { reasoning_content: message.thinking }
+					: {}),
 				// tool_call_id is only relevant for tool role messages
 				...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
 				...(toolCalls ? { tool_calls: toolCalls } : {})
@@ -693,6 +697,9 @@ export class ChatService {
 		return {
 			role: message.role as ChatRole,
 			content: contentParts,
+			...(message.role === 'assistant' && message.thinking
+				? { reasoning_content: message.thinking }
+				: {}),
 			...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
 			...(toolCalls ? { tool_calls: toolCalls } : {})
 		};

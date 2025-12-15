@@ -75,9 +75,8 @@ describe('ChatMessage delete for merged assistant messages', () => {
 		conversationsStore.activeMessages = allMessages;
 
 		// Avoid touching IndexedDB by stubbing the store call used by getDeletionInfo.
-		const originalGetConversationMessages = conversationsStore.getConversationMessages.bind(
-			conversationsStore
-		);
+		const originalGetConversationMessages =
+			conversationsStore.getConversationMessages.bind(conversationsStore);
 		conversationsStore.getConversationMessages = async () => allMessages;
 
 		const onDelete = vi.fn();
@@ -111,4 +110,3 @@ describe('ChatMessage delete for merged assistant messages', () => {
 		}
 	});
 });
-

@@ -137,4 +137,6 @@ test('tool output does not echo tool arguments back to the model', async ({ page
 	);
 	expect(assistantWithToolCall).toBeTruthy();
 	expect(JSON.stringify(assistantWithToolCall?.tool_calls ?? null)).toContain('LARGE_CODE_BEGIN');
+	// Preserve the model's reasoning across tool-call resumptions (required for gpt-oss).
+	expect(String(assistantWithToolCall?.reasoning_content ?? '')).toContain('reasoning-step-1');
 });
