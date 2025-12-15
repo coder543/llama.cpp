@@ -5,19 +5,22 @@
 	import { buttonVariants } from '$lib/components/ui/button/index.js';
 	import { Card } from '$lib/components/ui/card';
 	import { config } from '$lib/stores/settings.svelte';
+	import type { Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
 		hasRegularContent?: boolean;
 		isStreaming?: boolean;
 		reasoningContent: string | null;
+		children?: Snippet;
 	}
 
 	let {
 		class: className = '',
 		hasRegularContent = false,
 		isStreaming = false,
-		reasoningContent
+		reasoningContent,
+		children
 	}: Props = $props();
 
 	const currentConfig = config();
@@ -72,9 +75,11 @@
 			<div class="border-t border-muted px-3 pb-3">
 				<div class="pt-3">
 					<div class="text-xs leading-relaxed break-words whitespace-pre-wrap">
-						<slot>
+						{#if children}
+							{@render children()}
+						{:else}
 							{reasoningContent ?? ''}
-						</slot>
+						{/if}
 					</div>
 				</div>
 			</div>

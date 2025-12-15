@@ -35,6 +35,13 @@ export interface ApiChatMessageData {
 	role: ChatRole;
 	content: string | ApiChatMessageContentPart[];
 	timestamp?: number;
+	/**
+	 * Optional reasoning/thinking content to be sent back to the server.
+	 *
+	 * llama-server accepts this non-OpenAI field and uses it to preserve the model's
+	 * internal "thinking" blocks across tool-call resumptions (notably for gpt-oss).
+	 */
+	reasoning_content?: string;
 	tool_call_id?: string;
 	tool_calls?: ApiChatCompletionToolCallDelta[];
 }
@@ -183,6 +190,7 @@ export interface ApiLlamaCppServerProps {
 export interface ApiChatCompletionRequestMessage {
 	role: ChatRole;
 	content: string | ApiChatMessageContentPart[];
+	reasoning_content?: string;
 	tool_call_id?: string;
 	tool_calls?: ApiChatCompletionToolCallDelta[];
 }
