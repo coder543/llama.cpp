@@ -44,6 +44,8 @@
 	let disableAutoScroll = $derived(Boolean(config().disableAutoScroll));
 	let autoScrollEnabled = $state(true);
 	let chatScrollContainer: HTMLDivElement | undefined = $state();
+	// Always hand ChatMessages a fresh array so mutations in the store trigger rerenders/merges
+	const liveMessages = $derived.by(() => [...conversationsStore.activeMessages]);
 	let dragCounter = $state(0);
 	let isDragOver = $state(false);
 	let lastScrollTop = $state(0);
@@ -362,6 +364,14 @@
 			scrollInterval = undefined;
 		}
 	});
+
+	// Keep view pinned to bottom across message merges while auto-scroll is enabled.
+	$effect(() => {
+		void liveMessages;
+		if (!disableAutoScroll && autoScrollEnabled) {
+			queueMicrotask(() => scrollChatToBottom('instant'));
+		}
+	});
 </script>
 
 {#if isDragOver}
@@ -386,7 +396,7 @@
 	>
 		<ChatMessages
 			class="mb-16 md:mb-24"
-			messages={activeMessages()}
+			messages={liveMessages}
 			onUserAction={() => {
 				if (!disableAutoScroll) {
 					userScrolledUp = false;
