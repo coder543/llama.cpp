@@ -8,6 +8,7 @@
 	import type {
 		ApiChatCompletionToolCall,
 		ChatMessageSiblingInfo,
+		ChatMessageTimings,
 		DatabaseMessage
 	} from '$lib/types';
 
@@ -101,6 +102,51 @@
 				expression: typeof obj.expression === 'string' ? obj.expression : undefined,
 				result: typeof obj.result === 'string' ? obj.result : undefined,
 				duration_ms: typeof obj.duration_ms === 'number' ? obj.duration_ms : undefined
+			};
+		};
+
+		const sumTimings = (assistantIds: string[]): ChatMessageTimings | undefined => {
+			if (assistantIds.length <= 1) return undefined;
+
+			let predicted_n_sum = 0;
+			let predicted_ms_sum = 0;
+			let prompt_n_sum = 0;
+			let prompt_ms_sum = 0;
+			let cache_n_sum = 0;
+
+			let hasPredicted = false;
+			let hasPrompt = false;
+			let hasCache = false;
+
+			for (const id of assistantIds) {
+				const m = filteredMessages.find((x) => x.id === id);
+				const t = m?.timings;
+				if (!t) continue;
+
+				if (typeof t.predicted_n === 'number' && typeof t.predicted_ms === 'number') {
+					predicted_n_sum += t.predicted_n;
+					predicted_ms_sum += t.predicted_ms;
+					hasPredicted = true;
+				}
+
+				if (typeof t.prompt_n === 'number' && typeof t.prompt_ms === 'number') {
+					prompt_n_sum += t.prompt_n;
+					prompt_ms_sum += t.prompt_ms;
+					hasPrompt = true;
+				}
+
+				if (typeof t.cache_n === 'number') {
+					cache_n_sum += t.cache_n;
+					hasCache = true;
+				}
+			}
+
+			if (!hasPredicted && !hasPrompt && !hasCache) return undefined;
+
+			return {
+				...(hasPredicted ? { predicted_n: predicted_n_sum, predicted_ms: predicted_ms_sum } : {}),
+				...(hasPrompt ? { prompt_n: prompt_n_sum, prompt_ms: prompt_ms_sum } : {}),
+				...(hasCache ? { cache_n: cache_n_sum } : {})
 			};
 		};
 
@@ -198,11 +244,14 @@
 					totalSiblings: 1
 				};
 
+				const aggregatedTimings = sumTimings(toolParentIds);
+
 				const mergedAssistant: AssistantDisplayMessage = {
 					...(currentAssistant ?? msg),
 					content: currentAssistant?.content ?? '',
 					thinking: thinkingParts.filter(Boolean).join('\n\n'),
 					toolCalls: toolCallsCombined.length ? JSON.stringify(toolCallsCombined) : '',
+					...(aggregatedTimings ? { timings: aggregatedTimings } : {}),
 					_toolParentIds: toolParentIds,
 					_segments: segments,
 					_actionTargetId: msg.id,
