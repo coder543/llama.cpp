@@ -9,7 +9,8 @@
 		Moon,
 		ChevronLeft,
 		ChevronRight,
-		Database
+		Database,
+		Wrench
 	} from '@lucide/svelte';
 	import {
 		ChatSettingsFooter,
@@ -20,6 +21,8 @@
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
 	import { setMode } from 'mode-watcher';
 	import type { Component } from 'svelte';
+	import '$lib/services/tools'; // ensure built-in tools register
+	import { getAllTools } from '$lib/services/tools';
 
 	interface Props {
 		onSave?: () => void;
@@ -244,6 +247,16 @@
 					type: 'textarea'
 				}
 			]
+		},
+		{
+			title: 'Tools',
+			icon: Wrench,
+			fields: getAllTools().map((t) => ({
+				key: t.enableConfigKey,
+				label: t.label,
+				type: 'checkbox',
+				help: t.description
+			}))
 		}
 		// TODO: Experimental features section will be implemented after initial release
 		// This includes Python interpreter (Pyodide integration) and other experimental features

@@ -13,8 +13,15 @@ import {
 	findDescendantMessages,
 	findLeafNode
 } from '$lib/utils';
+import type { ApiChatCompletionToolCall, ApiToolDefinition } from '$lib/types';
 import { SvelteMap } from 'svelte/reactivity';
 import { DEFAULT_CONTEXT } from '$lib/constants/default-context';
+import {
+	getAllTools,
+	getEnabledToolDefinitions,
+	findToolByName,
+	isToolEnabled
+} from '$lib/services/tools/registry';
 
 /**
  * chatStore - Active AI interaction and streaming state management
@@ -462,6 +469,35 @@ class ChatStore {
 		);
 	}
 
+	private async createToolMessage(
+		convId: string,
+		content: string,
+		toolCallId?: string,
+		parentId?: string | null,
+		expression?: string
+	): Promise<DatabaseMessage | null> {
+		// Store expression + result as JSON for richer UI rendering
+		let storedContent = content;
+		if (expression) {
+			storedContent = JSON.stringify({ expression, result: content });
+		}
+
+		return await DatabaseService.createMessageBranch(
+			{
+				convId,
+				type: 'tool',
+				role: 'tool',
+				content: storedContent,
+				timestamp: Date.now(),
+				thinking: '',
+				toolCalls: '',
+				toolCallId,
+				children: []
+			},
+			parentId || null
+		);
+	}
+
 	private async streamChatCompletion(
 		allMessages: DatabaseMessage[],
 		assistantMessage: DatabaseMessage,
@@ -552,10 +588,12 @@ class ChatStore {
 				) => {
 					this.stopStreaming();
 
+					const finalToolCalls = toolCallContent || streamedToolCallContent || '';
+
 					const updateData: Record<string, unknown> = {
 						content: finalContent || streamedContent,
 						thinking: reasoningContent || streamedReasoningContent,
-						toolCalls: toolCallContent || streamedToolCallContent,
+						toolCalls: finalToolCalls,
 						timings
 					};
 					if (resolvedModel && !modelPersisted) {
@@ -566,8 +604,15 @@ class ChatStore {
 					const idx = conversationsStore.findMessageIndex(assistantMessage.id);
 					const uiUpdate: Partial<DatabaseMessage> = {
 						content: updateData.content as string,
-						toolCalls: updateData.toolCalls as string
+						toolCalls: finalToolCalls
 					};
+					if (
+						updateData.thinking !== undefined &&
+						updateData.thinking !== null &&
+						String(updateData.thinking).length > 0
+					) {
+						uiUpdate.thinking = updateData.thinking as string;
+					}
 					if (timings) uiUpdate.timings = timings;
 					if (resolvedModel) uiUpdate.model = resolvedModel;
 
@@ -581,6 +626,15 @@ class ChatStore {
 
 					if (isRouterMode()) {
 						modelsStore.fetchRouterModels().catch(console.error);
+					}
+
+					// If the model emitted tool calls, execute any enabled tools and continue the exchange.
+					if (finalToolCalls) {
+						await this.processToolCallsAndContinue(
+							finalToolCalls,
+							assistantMessage,
+							modelOverride || null
+						);
 					}
 				},
 				onError: (error: Error) => {
@@ -1348,6 +1402,77 @@ class ChatStore {
 		return Array.from(this.chatStreamingStates.keys());
 	}
 
+	private async processToolCallsAndContinue(
+		toolCallContent: string,
+		sourceAssistant: DatabaseMessage,
+		modelOverride?: string | null
+	): Promise<void> {
+		const currentConfig = config();
+
+		let toolCalls: ApiChatCompletionToolCall[] = [];
+		try {
+			const parsed = JSON.parse(toolCallContent);
+			if (Array.isArray(parsed)) {
+				toolCalls = parsed as ApiChatCompletionToolCall[];
+			}
+		} catch (error) {
+			console.warn('Failed to parse tool calls', error);
+			return;
+		}
+
+		const relevantCalls = toolCalls.filter((call) => {
+			const fnName = call.function?.name;
+			return Boolean(fnName && call.id && isToolEnabled(fnName, currentConfig));
+		});
+		if (relevantCalls.length === 0) return;
+
+		const activeConv = conversationsStore.activeConversation;
+		if (!activeConv) return;
+
+		const toolMessages: DatabaseMessage[] = [];
+
+		for (const call of relevantCalls) {
+			const args = call.function?.arguments ?? '';
+			const fnName = call.function?.name!;
+			const registration = findToolByName(fnName);
+			if (!registration?.execute) continue;
+
+			const { content, expression } = await registration.execute(args);
+			const toolMsg = await this.createToolMessage(
+				activeConv.id,
+				content || '(no output)',
+				call.id,
+				sourceAssistant.id,
+				expression
+			);
+
+			if (toolMsg) {
+				toolMessages.push(toolMsg);
+				conversationsStore.addMessageToActive(toolMsg);
+			}
+		}
+
+		if (toolMessages.length === 0) return;
+
+		// Create a new assistant message to continue the conversation
+		const newAssistant = await this.createAssistantMessage(
+			toolMessages[toolMessages.length - 1]?.id || sourceAssistant.id
+		);
+		if (!newAssistant) return;
+
+		conversationsStore.addMessageToActive(newAssistant);
+		this.setChatLoading(activeConv.id, true);
+		this.clearChatStreaming(activeConv.id);
+
+		await this.streamChatCompletion(
+			conversationsStore.activeMessages.slice(0, -1),
+			newAssistant,
+			undefined,
+			undefined,
+			modelOverride || null
+		);
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────────
 	// Utilities
 	// ─────────────────────────────────────────────────────────────────────────────
@@ -1402,6 +1527,12 @@ class ChatStore {
 			apiOptions.dry_penalty_last_n = Number(currentConfig.dry_penalty_last_n);
 		if (currentConfig.samplers) apiOptions.samplers = currentConfig.samplers;
 		if (currentConfig.custom) apiOptions.custom = currentConfig.custom;
+
+		const tools = getEnabledToolDefinitions(currentConfig);
+		if (tools.length) {
+			apiOptions.tools = tools;
+			apiOptions.tool_choice = 'auto';
+		}
 
 		return apiOptions;
 	}

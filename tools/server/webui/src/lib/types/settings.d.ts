@@ -45,6 +45,9 @@ export interface SettingsChatServiceOptions {
 	samplers?: string | string[];
 	// Custom parameters
 	custom?: string;
+	// Tools
+	tools?: unknown[];
+	tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
 	timings_per_token?: boolean;
 	// Callbacks
 	onChunk?: (chunk: string) => void;

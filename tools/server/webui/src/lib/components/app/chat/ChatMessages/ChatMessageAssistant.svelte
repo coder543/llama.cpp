@@ -4,10 +4,10 @@
 		ChatMessageActions,
 		ChatMessageStatistics,
 		ChatMessageThinkingBlock,
-		CopyToClipboardIcon,
 		MarkdownContent,
 		ModelsSelector
 	} from '$lib/components/app';
+	import type { DatabaseMessage, ApiChatCompletionToolCall } from '$lib/types';
 	import { useProcessingState } from '$lib/hooks/use-processing-state.svelte';
 	import { useModelChangeValidation } from '$lib/hooks/use-model-change-validation.svelte';
 	import { isLoading } from '$lib/stores/chat.svelte';
@@ -53,6 +53,9 @@
 		textareaElement?: HTMLTextAreaElement;
 		thinkingContent: string | null;
 		toolCallContent: ApiChatCompletionToolCall[] | string | null;
+		toolParentIds?: string[];
+		segments?: any[] | null;
+		toolMessagesCollected?: { toolCallId?: string | null; parsed: any }[] | null;
 	}
 
 	let {
@@ -80,17 +83,86 @@
 		siblingInfo = null,
 		textareaElement = $bindable(),
 		thinkingContent,
-		toolCallContent = null
+		toolCallContent = null,
+		toolParentIds = [message.id],
+		segments: segmentsProp = null,
+		toolMessagesCollected: toolMessagesCollectedProp = (message as any)._toolMessagesCollected ??
+			null
 	}: Props = $props();
+
+	// Keep segments/tool messages in sync with the merged assistant produced upstream.
+	let segments = $derived(segmentsProp ?? (message as any)._segments ?? null);
+	let toolMessagesCollected = $derived(
+		toolMessagesCollectedProp ?? (message as any)._toolMessagesCollected ?? null
+	);
 
 	const toolCalls = $derived(
 		Array.isArray(toolCallContent) ? (toolCallContent as ApiChatCompletionToolCall[]) : null
 	);
-	const fallbackToolCalls = $derived(typeof toolCallContent === 'string' ? toolCallContent : null);
 
 	const processingState = useProcessingState();
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
+	const toolMessages = $derived<DatabaseMessage[]>(
+		(() => {
+			const ids = new Set<string>();
+			if (toolCalls) {
+				for (const tc of toolCalls) {
+					if (tc.id) ids.add(tc.id);
+				}
+			}
+			const collected = toolMessagesCollected ?? [];
+			return conversationsStore.activeMessages
+				.filter(
+					(m) =>
+						m.role === 'tool' &&
+						(toolParentIds.includes(m.parent) || (m.toolCallId && ids.has(m.toolCallId)))
+				)
+				.concat(
+					collected.map((c: { toolCallId?: string | null; parsed: any }) => ({
+						role: 'tool',
+						content: JSON.stringify(c.parsed),
+						toolCallId: c.toolCallId ?? undefined,
+						parent: toolParentIds[0]
+					})) as any
+				);
+		})()
+	);
+	const toolMessagesById = $derived<Record<string, { expression?: string; result?: string }>>(
+		(() => {
+			const map: Record<string, { expression?: string; result?: string }> = {};
+			for (const t of toolMessages) {
+				const parsed = parseToolMessage(t);
+				if (parsed && t.toolCallId) {
+					map[t.toolCallId] = parsed;
+				}
+			}
+			return map;
+		})()
+	);
+
+	const collectedById = $derived<Record<string, { expression?: string; result?: string }>>(
+		(() => {
+			const map: Record<string, { expression?: string; result?: string }> = {};
+			(toolMessagesCollected ?? []).forEach((c: { toolCallId?: string | null; parsed: any }) => {
+				if (c.toolCallId) {
+					map[c.toolCallId] = c.parsed;
+				}
+			});
+			return map;
+		})()
+	);
+
+	function getToolResult(toolCall: ApiChatCompletionToolCall) {
+		const idSetMatch = toolCall.id ? toolMessagesById[toolCall.id] : null;
+		if (idSetMatch) return idSetMatch;
+		if (toolCall.id && collectedById[toolCall.id]) return collectedById[toolCall.id];
+		return null;
+	}
+
+	function advanceToolResult(toolCall: ApiChatCompletionToolCall) {
+		return getToolResult(toolCall) ?? null;
+	}
 	let displayedModel = $derived((): string | null => {
 		if (message.model) {
 			return message.model;
@@ -116,56 +188,47 @@
 		}
 	});
 
-	function formatToolCallBadge(toolCall: ApiChatCompletionToolCall, index: number) {
-		const callNumber = index + 1;
-		const functionName = toolCall.function?.name?.trim();
-		const label = functionName || `Call #${callNumber}`;
-
-		const payload: Record<string, unknown> = {};
-
-		const id = toolCall.id?.trim();
-		if (id) {
-			payload.id = id;
-		}
-
-		const type = toolCall.type?.trim();
-		if (type) {
-			payload.type = type;
-		}
-
-		if (toolCall.function) {
-			const fnPayload: Record<string, unknown> = {};
-
-			const name = toolCall.function.name?.trim();
-			if (name) {
-				fnPayload.name = name;
+	function parseArguments(
+		toolCall: ApiChatCompletionToolCall
+	): { pairs: { key: string; value: string }[] } | { raw: string } | null {
+		const rawArguments = toolCall.function?.arguments?.trim();
+		if (!rawArguments) return null;
+		try {
+			const parsed = JSON.parse(rawArguments);
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+				const pairs = Object.entries(parsed).map(([key, value]) => ({
+					key,
+					value: typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+				}));
+				return { pairs };
 			}
-
-			const rawArguments = toolCall.function.arguments?.trim();
-			if (rawArguments) {
-				try {
-					fnPayload.arguments = JSON.parse(rawArguments);
-				} catch {
-					fnPayload.arguments = rawArguments;
-				}
-			}
-
-			if (Object.keys(fnPayload).length > 0) {
-				payload.function = fnPayload;
-			}
+		} catch {
+			// ignore parse errors, fall back to raw
 		}
-
-		const formattedPayload = JSON.stringify(payload, null, 2);
-
-		return {
-			label,
-			tooltip: formattedPayload,
-			copyValue: formattedPayload
-		};
+		return { raw: rawArguments };
 	}
 
-	function handleCopyToolCall(payload: string) {
-		void copyToClipboard(payload, 'Tool call copied to clipboard');
+	function parseToolMessage(msg: DatabaseMessage): { expression?: string; result?: string } | null {
+		if (!msg.content) return null;
+		try {
+			const parsed = JSON.parse(msg.content);
+			if (parsed && typeof parsed === 'object') {
+				return {
+					expression: parsed.expression ?? undefined,
+					result: parsed.result ?? undefined
+				};
+			}
+		} catch {
+			// not JSON; fall back
+		}
+		return { result: msg.content };
+	}
+
+	function getToolLabel(toolCall: ApiChatCompletionToolCall, index: number) {
+		const name = toolCall.function?.name ?? '';
+		if (name === 'calculator') return 'Calculator';
+		if (name === 'code_interpreter_javascript') return 'Code Interpreter (JavaScript)';
+		return name || `Call #${index + 1}`;
 	}
 </script>
 
@@ -176,10 +239,122 @@
 >
 	{#if thinkingContent}
 		<ChatMessageThinkingBlock
-			reasoningContent={thinkingContent}
-			isStreaming={!message.timestamp}
+			reasoningContent={segments && segments.length ? null : thinkingContent}
+			isStreaming={!message.timestamp || isLoading()}
 			hasRegularContent={!!messageContent?.trim()}
-		/>
+		>
+			{#if segments && segments.length}
+				{#each segments as segment, segIndex}
+					{#if segment.kind === 'thinking'}
+						<div class="text-xs leading-relaxed break-words whitespace-pre-wrap">
+							{segment.content}
+						</div>
+					{:else if segment.kind === 'tool'}
+						{#each segment.toolCalls as toolCall, index (toolCall.id ?? `${segIndex}-${index}`)}
+							{@const argsParsed = parseArguments(toolCall)}
+							{@const parsed = advanceToolResult(toolCall)}
+							{@const collectedResult = toolMessagesCollected
+								? toolMessagesCollected.find(
+										(c: { toolCallId?: string | null; parsed: any }) => c.toolCallId === toolCall.id
+									)?.parsed?.result
+								: undefined}
+							<div
+								class="mt-2 space-y-1 rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-2.5 py-2"
+								data-testid="tool-call-block"
+							>
+								<div class="flex items-center gap-1 text-xs font-semibold">
+									<Wrench class="h-3.5 w-3.5" />
+									<span>{getToolLabel(toolCall, index)}</span>
+								</div>
+								{#if argsParsed}
+									<div class="text-[12px] text-muted-foreground">Arguments</div>
+									{#if 'pairs' in argsParsed}
+										{#each argsParsed.pairs as pair (pair.key)}
+											<div class="mt-1 rounded-sm bg-background/70 px-2 py-1.5">
+												<div class="text-[12px] font-semibold text-foreground">{pair.key}</div>
+												<pre
+													class="mt-0.5 font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{pair.value}
+												</pre>
+											</div>
+										{/each}
+									{:else}
+										<pre class="font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{argsParsed.raw}
+										</pre>
+									{/if}
+								{/if}
+								{#if parsed && parsed.result !== undefined}
+									<div class="text-[12px] text-muted-foreground">Result</div>
+									<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+										{parsed.result}
+									</div>
+								{:else if collectedResult !== undefined}
+									<div class="text-[12px] text-muted-foreground">Result</div>
+									<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+										{collectedResult}
+									</div>
+								{/if}
+							</div>
+						{/each}
+					{/if}
+				{/each}
+			{/if}
+		</ChatMessageThinkingBlock>
+	{/if}
+
+	{#if !thinkingContent && segments && segments.length}
+		{#each segments as segment, segIndex}
+			{#if segment.kind === 'tool'}
+				{#each segment.toolCalls as toolCall, index (toolCall.id ?? `${segIndex}-${index}`)}
+					{@const argsParsed = parseArguments(toolCall)}
+					{@const parsed = advanceToolResult(toolCall)}
+					{@const collectedResult = toolMessagesCollected
+						? toolMessagesCollected.find(
+								(c: { toolCallId?: string | null; parsed: any }) => c.toolCallId === toolCall.id
+							)?.parsed?.result
+						: undefined}
+					<div
+						class="mt-2 space-y-1 rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-2.5 py-2"
+						data-testid="tool-call-block"
+					>
+						<div class="flex items-center gap-1 text-xs font-semibold">
+							<Wrench class="h-3.5 w-3.5" />
+							<span>{getToolLabel(toolCall, index)}</span>
+						</div>
+						{#if argsParsed}
+							<div class="text-[12px] text-muted-foreground">Arguments</div>
+							{#if 'pairs' in argsParsed}
+								{#each argsParsed.pairs as pair (pair.key)}
+									<div class="mt-1 rounded-sm bg-background/70 px-2 py-1.5">
+										<div class="text-[12px] font-semibold text-foreground">{pair.key}</div>
+										<pre
+											class="mt-0.5 font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{pair.value}
+										</pre>
+									</div>
+								{/each}
+							{:else}
+								<pre class="font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{argsParsed.raw}
+								</pre>
+							{/if}
+						{/if}
+						{#if parsed && parsed.result !== undefined}
+							<div class="text-[12px] text-muted-foreground">Result</div>
+							<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+								{parsed.result}
+							</div>
+						{:else if collectedResult !== undefined}
+							<div class="text-[12px] text-muted-foreground">Result</div>
+							<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+								{collectedResult}
+							</div>
+						{/if}
+					</div>
+				{/each}
+			{/if}
+		{/each}
 	{/if}
 
 	{#if message?.role === 'assistant' && isLoading() && !message?.content?.trim()}
@@ -232,9 +407,9 @@
 		</div>
 	{:else if message.role === 'assistant'}
 		{#if config().disableReasoningFormat}
-			<pre class="raw-output">{messageContent || ''}</pre>
+			<pre class="raw-output">{messageContent}</pre>
 		{:else}
-			<MarkdownContent content={messageContent || ''} />
+			<MarkdownContent content={messageContent ?? ''} />
 		{/if}
 	{:else}
 		<div class="text-sm whitespace-pre-wrap">
@@ -263,48 +438,6 @@
 					/>
 				{/if}
 			</span>
-		{/if}
-
-		{#if config().showToolCalls}
-			{#if (toolCalls && toolCalls.length > 0) || fallbackToolCalls}
-				<span class="inline-flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-					<span class="inline-flex items-center gap-1">
-						<Wrench class="h-3.5 w-3.5" />
-
-						<span>Tool calls:</span>
-					</span>
-
-					{#if toolCalls && toolCalls.length > 0}
-						{#each toolCalls as toolCall, index (toolCall.id ?? `${index}`)}
-							{@const badge = formatToolCallBadge(toolCall, index)}
-							<button
-								type="button"
-								class="tool-call-badge inline-flex cursor-pointer items-center gap-1 rounded-sm bg-muted-foreground/15 px-1.5 py-0.75"
-								title={badge.tooltip}
-								aria-label={`Copy tool call ${badge.label}`}
-								onclick={() => handleCopyToolCall(badge.copyValue)}
-							>
-								{badge.label}
-								<CopyToClipboardIcon
-									text={badge.copyValue}
-									ariaLabel={`Copy tool call ${badge.label}`}
-								/>
-							</button>
-						{/each}
-					{:else if fallbackToolCalls}
-						<button
-							type="button"
-							class="tool-call-badge tool-call-badge--fallback inline-flex cursor-pointer items-center gap-1 rounded-sm bg-muted-foreground/15 px-1.5 py-0.75"
-							title={fallbackToolCalls}
-							aria-label="Copy tool call payload"
-							onclick={() => handleCopyToolCall(fallbackToolCalls)}
-						>
-							{fallbackToolCalls}
-							<CopyToClipboardIcon text={fallbackToolCalls} ariaLabel="Copy tool call payload" />
-						</button>
-					{/if}
-				</span>
-			{/if}
 		{/if}
 	</div>
 
