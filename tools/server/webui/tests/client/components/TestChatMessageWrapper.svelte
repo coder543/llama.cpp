@@ -14,4 +14,3 @@
 		<ChatMessage message={props.message} onDelete={props.onDelete} />
 	</Sidebar.Provider>
 </Tooltip.Provider>
-
