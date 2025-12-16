@@ -25,8 +25,14 @@
 	import { SvelteSet } from 'svelte/reactivity';
 
 	type ToolSegment =
+		| { kind: 'content'; content: string; parentId: string }
 		| { kind: 'thinking'; content: string }
-		| { kind: 'tool'; toolCalls: ApiChatCompletionToolCall[]; parentId: string };
+		| {
+				kind: 'tool';
+				toolCalls: ApiChatCompletionToolCall[];
+				parentId: string;
+				inThinking: boolean;
+		  };
 	type ToolParsed = { expression?: string; result?: string; duration_ms?: number };
 	type CollectedToolMessage = {
 		toolCallId?: string | null;
@@ -114,6 +120,11 @@
 	let toolMessagesCollected = $derived(
 		toolMessagesCollectedProp ?? (message as MessageWithToolExtras)._toolMessagesCollected ?? null
 	);
+
+	let hasRegularContent = $derived.by(() => {
+		if (messageContent?.trim()) return true;
+		return (segments ?? []).some((s) => s.kind === 'content' && Boolean(s.content?.trim()));
+	});
 
 	const toolCalls = $derived(
 		Array.isArray(toolCallContent) ? (toolCallContent as ApiChatCompletionToolCall[]) : null
@@ -265,6 +276,14 @@
 		if (name === 'code_interpreter_javascript') return 'Code Interpreter (JavaScript)';
 		return name || `Call #${index + 1}`;
 	}
+
+	function segmentToolInThinking(segment: ToolSegment): boolean {
+		if (segment.kind !== 'tool') return false;
+		const maybe = segment as unknown as { inThinking?: unknown };
+		if (typeof maybe.inThinking === 'boolean') return maybe.inThinking;
+		// Back-compat fallback: if we don't know, treat as in-reasoning when there is a thinking block.
+		return Boolean(thinkingContent);
+	}
 </script>
 
 <div
@@ -276,7 +295,7 @@
 		<ChatMessageThinkingBlock
 			reasoningContent={segments && segments.length ? null : thinkingContent}
 			isStreaming={!message.timestamp || isLoading()}
-			hasRegularContent={!!messageContent?.trim()}
+			{hasRegularContent}
 		>
 			{#if segments && segments.length}
 				{#each segments as segment, segIndex (segIndex)}
@@ -284,7 +303,7 @@
 						<div class="text-xs leading-relaxed break-words whitespace-pre-wrap">
 							{segment.content}
 						</div>
-					{:else if segment.kind === 'tool'}
+					{:else if segment.kind === 'tool' && segmentToolInThinking(segment)}
 						{#each segment.toolCalls as toolCall, index (toolCall.id ?? `${segIndex}-${index}`)}
 							{@const argsParsed = parseArguments(toolCall)}
 							{@const parsed = advanceToolResult(toolCall)}
@@ -354,75 +373,6 @@
 		</ChatMessageThinkingBlock>
 	{/if}
 
-	{#if !thinkingContent && segments && segments.length}
-		{#each segments as segment, segIndex (segIndex)}
-			{#if segment.kind === 'tool'}
-				{#each segment.toolCalls as toolCall, index (toolCall.id ?? `${segIndex}-${index}`)}
-					{@const argsParsed = parseArguments(toolCall)}
-					{@const parsed = advanceToolResult(toolCall)}
-					{@const collectedResult = toolMessagesCollected
-						? toolMessagesCollected.find((c) => c.toolCallId === toolCall.id)?.parsed?.result
-						: undefined}
-					{@const collectedDurationMs = toolMessagesCollected
-						? toolMessagesCollected.find((c) => c.toolCallId === toolCall.id)?.parsed?.duration_ms
-						: undefined}
-					{@const durationMs = parsed?.duration_ms ?? collectedDurationMs}
-					{@const durationText = formatDurationSeconds(durationMs)}
-					<div
-						class="mt-2 space-y-1 rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-2.5 py-2"
-						data-testid="tool-call-block"
-					>
-						<div class="flex items-center justify-between gap-2">
-							<div class="flex items-center gap-1 text-xs font-semibold">
-								<Wrench class="h-3.5 w-3.5" />
-								<span>{getToolLabel(toolCall, index)}</span>
-							</div>
-							{#if durationText}
-								<BadgeChatStatistic icon={Clock} value={durationText} />
-							{/if}
-						</div>
-						{#if argsParsed}
-							<div class="text-[12px] text-muted-foreground">Arguments</div>
-							{#if 'pairs' in argsParsed}
-								{#each argsParsed.pairs as pair (pair.key)}
-									<div class="mt-1 rounded-sm bg-background/70 px-2 py-1.5">
-										<div class="text-[12px] font-semibold text-foreground">{pair.key}</div>
-										{#if pair.key === 'code' && toolCall.function?.name === 'code_interpreter_javascript'}
-											<MarkdownContent
-												class="mt-0.5 text-[12px] leading-snug"
-												content={toFencedCodeBlock(pair.value, 'javascript')}
-											/>
-										{:else}
-											<pre
-												class="mt-0.5 font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
-{pair.value}
-											</pre>
-										{/if}
-									</div>
-								{/each}
-							{:else}
-								<pre class="font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
-{argsParsed.raw}
-								</pre>
-							{/if}
-						{/if}
-						{#if parsed && parsed.result !== undefined}
-							<div class="text-[12px] text-muted-foreground">Result</div>
-							<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
-								{parsed.result}
-							</div>
-						{:else if collectedResult !== undefined}
-							<div class="text-[12px] text-muted-foreground">Result</div>
-							<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
-								{collectedResult}
-							</div>
-						{/if}
-					</div>
-				{/each}
-			{/if}
-		{/each}
-	{/if}
-
 	{#if message?.role === 'assistant' && isLoading() && !message?.content?.trim()}
 		<div class="mt-6 w-full max-w-[48rem]" in:fade>
 			<div class="processing-container">
@@ -474,6 +424,75 @@
 	{:else if message.role === 'assistant'}
 		{#if config().disableReasoningFormat}
 			<pre class="raw-output">{messageContent}</pre>
+		{:else if segments && segments.length}
+			{#each segments as segment, segIndex (segIndex)}
+				{#if segment.kind === 'content'}
+					<MarkdownContent content={segment.content ?? ''} />
+				{:else if segment.kind === 'tool' && (!thinkingContent || !segmentToolInThinking(segment))}
+					{#each segment.toolCalls as toolCall, index (toolCall.id ?? `${segIndex}-${index}`)}
+						{@const argsParsed = parseArguments(toolCall)}
+						{@const parsed = advanceToolResult(toolCall)}
+						{@const collectedResult = toolMessagesCollected
+							? toolMessagesCollected.find((c) => c.toolCallId === toolCall.id)?.parsed?.result
+							: undefined}
+						{@const collectedDurationMs = toolMessagesCollected
+							? toolMessagesCollected.find((c) => c.toolCallId === toolCall.id)?.parsed?.duration_ms
+							: undefined}
+						{@const durationMs = parsed?.duration_ms ?? collectedDurationMs}
+						{@const durationText = formatDurationSeconds(durationMs)}
+						<div
+							class="mt-2 space-y-1 rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-2.5 py-2"
+							data-testid="tool-call-block"
+						>
+							<div class="flex items-center justify-between gap-2">
+								<div class="flex items-center gap-1 text-xs font-semibold">
+									<Wrench class="h-3.5 w-3.5" />
+									<span>{getToolLabel(toolCall, index)}</span>
+								</div>
+								{#if durationText}
+									<BadgeChatStatistic icon={Clock} value={durationText} />
+								{/if}
+							</div>
+							{#if argsParsed}
+								<div class="text-[12px] text-muted-foreground">Arguments</div>
+								{#if 'pairs' in argsParsed}
+									{#each argsParsed.pairs as pair (pair.key)}
+										<div class="mt-1 rounded-sm bg-background/70 px-2 py-1.5">
+											<div class="text-[12px] font-semibold text-foreground">{pair.key}</div>
+											{#if pair.key === 'code' && toolCall.function?.name === 'code_interpreter_javascript'}
+												<MarkdownContent
+													class="mt-0.5 text-[12px] leading-snug"
+													content={toFencedCodeBlock(pair.value, 'javascript')}
+												/>
+											{:else}
+												<pre
+													class="mt-0.5 font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{pair.value}
+												</pre>
+											{/if}
+										</div>
+									{/each}
+								{:else}
+									<pre class="font-mono text-[12px] leading-snug break-words whitespace-pre-wrap">
+{argsParsed.raw}
+									</pre>
+								{/if}
+							{/if}
+							{#if parsed && parsed.result !== undefined}
+								<div class="text-[12px] text-muted-foreground">Result</div>
+								<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+									{parsed.result}
+								</div>
+							{:else if collectedResult !== undefined}
+								<div class="text-[12px] text-muted-foreground">Result</div>
+								<div class="rounded-sm bg-background/80 px-2 py-1 font-mono text-[12px]">
+									{collectedResult}
+								</div>
+							{/if}
+						</div>
+					{/each}
+				{/if}
+			{/each}
 		{:else}
 			<MarkdownContent content={messageContent ?? ''} />
 		{/if}
