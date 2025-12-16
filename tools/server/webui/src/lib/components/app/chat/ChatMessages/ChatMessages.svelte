@@ -50,8 +50,14 @@
 	});
 
 	type ToolSegment =
+		| { kind: 'content'; content: string; parentId: string }
 		| { kind: 'thinking'; content: string }
-		| { kind: 'tool'; toolCalls: ApiChatCompletionToolCall[]; parentId: string };
+		| {
+				kind: 'tool';
+				toolCalls: ApiChatCompletionToolCall[];
+				parentId: string;
+				inThinking: boolean;
+		  };
 	type CollectedToolMessage = {
 		toolCallId?: string | null;
 		parsed: { expression?: string; result?: string; duration_ms?: number };
@@ -161,6 +167,7 @@
 				// Collapse consecutive assistant/tool chains into one display message
 				const toolParentIds: string[] = [];
 				const thinkingParts: string[] = [];
+				const contentParts: string[] = [];
 				const toolCallsCombined: ApiChatCompletionToolCall[] = [];
 				const segments: ToolSegment[] = [];
 				const toolMessagesCollected: CollectedToolMessage[] = [];
@@ -175,6 +182,16 @@
 					if (currentAssistant.thinking) {
 						thinkingParts.push(currentAssistant.thinking);
 						segments.push({ kind: 'thinking', content: currentAssistant.thinking });
+					}
+
+					const hasContent = Boolean(currentAssistant.content?.trim());
+					if (hasContent) {
+						contentParts.push(currentAssistant.content);
+						segments.push({
+							kind: 'content',
+							content: currentAssistant.content,
+							parentId: currentAssistant.id
+						});
 					}
 					let thisAssistantToolCalls: ApiChatCompletionToolCall[] = [];
 					if (currentAssistant.toolCalls) {
@@ -196,7 +213,10 @@
 						segments.push({
 							kind: 'tool',
 							toolCalls: thisAssistantToolCalls,
-							parentId: currentAssistant.id
+							parentId: currentAssistant.id,
+							// Heuristic: only treat tool calls as "in reasoning" when the assistant hasn't
+							// started emitting user-visible content yet.
+							inThinking: Boolean(currentAssistant.thinking) && !hasContent
 						});
 					}
 
@@ -248,7 +268,8 @@
 
 				const mergedAssistant: AssistantDisplayMessage = {
 					...(currentAssistant ?? msg),
-					content: currentAssistant?.content ?? '',
+					// Keep a plain-text combined content for edit/copy; display can use `_segments` for ordering.
+					content: contentParts.filter(Boolean).join('\n\n'),
 					thinking: thinkingParts.filter(Boolean).join('\n\n'),
 					toolCalls: toolCallsCombined.length ? JSON.stringify(toolCallsCombined) : '',
 					...(aggregatedTimings ? { timings: aggregatedTimings } : {}),
