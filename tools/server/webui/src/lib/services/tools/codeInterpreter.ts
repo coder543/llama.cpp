@@ -11,7 +11,7 @@ export const codeInterpreterToolDefinition: ApiToolDefinition = {
 	function: {
 		name: CODE_INTERPRETER_JS_TOOL_NAME,
 		description:
-			'Execute JavaScript in a sandboxed environment. Returns console output and the final evaluated value.',
+			'Execute JavaScript in a sandboxed Worker. Your code runs inside an async function (top-level await is supported). Do not wrap code in an async IIFE like (async () => { ... })() unless you return/await it, otherwise the tool may finish before async logs run. If you use promises, they must be awaited. Returns combined console output and the final evaluated value. (no output) likely indicates either an unawaited promise or that you did not output anything.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -336,7 +336,7 @@ registerTool({
 		} else if (result !== undefined) {
 			combined += result;
 		} else if (!combined) {
-			combined = '(no output)';
+			combined = '(no output, did you forget to await a top level promise?)';
 		}
 		return { content: combined };
 	}

@@ -42,7 +42,7 @@ describe('ChatMessages inline tool rendering', () => {
 
 		// Message chain: user -> assistant(thinking+toolcall) -> tool -> assistant(thinking) -> tool -> assistant(final)
 		const user = msg('u1', 'user', 'Question', null);
-		const a1 = msg('a1', 'assistant', '', user.id, {
+		const a1 = msg('a1', 'assistant', 'Let me calculate that.', user.id, {
 			thinking: 'step1',
 			toolCalls: JSON.stringify([
 				{
@@ -102,5 +102,82 @@ describe('ChatMessages inline tool rendering', () => {
 		expect(container.textContent).toContain('20.25/7.84');
 		expect(container.textContent).toContain('1.3689');
 		expect(container.textContent).toContain('1.23s');
+
+		// Content produced before the first tool call should not be lost when the chain collapses.
+		expect(container.textContent).toContain('Let me calculate that.');
+	});
+
+	it('does not render post-reasoning tool calls inside the reasoning block', async () => {
+		settingsStore.config = {
+			...SETTING_CONFIG_DEFAULT,
+			enableCalculatorTool: true,
+			showThoughtInProgress: true
+		};
+
+		conversationsStore.activeConversation = {
+			id: 'c1',
+			name: 'Test',
+			currNode: null,
+			lastModified: Date.now()
+		};
+
+		const user = msg('u1', 'user', 'Question', null);
+		const a1 = msg('a1', 'assistant', 'Here is the answer (before tool).', user.id, {
+			thinking: 'done thinking',
+			toolCalls: JSON.stringify([
+				{
+					id: 'call-1',
+					type: 'function',
+					function: { name: 'calculator', arguments: JSON.stringify({ expression: '1+1' }) }
+				}
+			]),
+			// Simulate streaming so the reasoning block is expanded and in-DOM.
+			timestamp: 0
+		});
+		const t1 = msg(
+			't1',
+			'tool',
+			JSON.stringify({ expression: '1+1', result: '2', duration_ms: 10 }),
+			a1.id,
+			{
+				toolCallId: 'call-1'
+			}
+		);
+		const a2 = msg('a2', 'assistant', 'And here is the rest (after tool).', t1.id, {
+			timestamp: 0
+		});
+
+		const messages = [user, a1, t1, a2];
+		conversationsStore.activeMessages = messages;
+
+		const { container } = render(TestMessagesWrapper, {
+			target: document.body,
+			props: { messages }
+		});
+
+		const assistant = container.querySelector('[aria-label="Assistant message with actions"]');
+		expect(assistant).toBeTruthy();
+
+		// Tool call should exist overall...
+		expect(container.querySelectorAll('[data-testid="tool-call-block"]').length).toBe(1);
+
+		// ...but it should not be rendered inside the reasoning collapsible content.
+		const reasoningRoot = assistant
+			? Array.from(assistant.querySelectorAll('[data-state]')).find((el) =>
+					(el.textContent ?? '').includes('Reasoning')
+				)
+			: null;
+		expect(reasoningRoot).toBeTruthy();
+		expect(reasoningRoot?.querySelectorAll('[data-testid="tool-call-block"]').length ?? 0).toBe(0);
+
+		// Ordering: pre-tool content -> tool arguments -> post-tool content.
+		const fullText = container.textContent ?? '';
+		expect(fullText.indexOf('Here is the answer (before tool).')).toBeGreaterThanOrEqual(0);
+		expect(fullText.indexOf('Arguments')).toBeGreaterThan(
+			fullText.indexOf('Here is the answer (before tool).')
+		);
+		expect(fullText.indexOf('And here is the rest (after tool).')).toBeGreaterThan(
+			fullText.indexOf('Arguments')
+		);
 	});
 });
