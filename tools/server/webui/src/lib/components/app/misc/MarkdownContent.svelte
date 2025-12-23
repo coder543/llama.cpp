@@ -37,7 +37,6 @@
 	let containerRef = $state<HTMLDivElement>();
 	let renderedBlocks = $state<MarkdownBlock[]>([]);
 	let unstableBlockHtml = $state('');
-	let fallbackHtml = $state('');
 	let previewDialogOpen = $state(false);
 	let previewCode = $state('');
 	let previewLanguage = $state('text');
@@ -326,8 +325,6 @@
 	 * @param markdown - The markdown content to render
 	 */
 	async function updateRenderedBlocks(markdown: string) {
-		fallbackHtml = markdown ? escapeHtml(markdown) : '';
-
 		pendingMarkdown = markdown;
 
 		if (isProcessing) {
@@ -343,7 +340,6 @@
 
 				await processMarkdown(nextMarkdown);
 			}
-			fallbackHtml = '';
 		} catch (error) {
 			console.error('Failed to process markdown:', error);
 			renderedBlocks = [];
@@ -388,25 +384,18 @@
 </script>
 
 <div bind:this={containerRef} class={className}>
-	{#if fallbackHtml}
-		<div class="markdown-block markdown-block--unstable" data-block-id="fallback">
+	{#each renderedBlocks as block (block.id)}
+		<div class="markdown-block" data-block-id={block.id}>
 			<!-- eslint-disable-next-line no-at-html-tags -->
-			{@html fallbackHtml}
+			{@html block.html}
 		</div>
-	{:else}
-		{#each renderedBlocks as block (block.id)}
-			<div class="markdown-block" data-block-id={block.id}>
-				<!-- eslint-disable-next-line no-at-html-tags -->
-				{@html block.html}
-			</div>
-		{/each}
+	{/each}
 
-		{#if unstableBlockHtml}
-			<div class="markdown-block markdown-block--unstable" data-block-id="unstable">
-				<!-- eslint-disable-next-line no-at-html-tags -->
-				{@html unstableBlockHtml}
-			</div>
-		{/if}
+	{#if unstableBlockHtml}
+		<div class="markdown-block markdown-block--unstable" data-block-id="unstable">
+			<!-- eslint-disable-next-line no-at-html-tags -->
+			{@html unstableBlockHtml}
+		</div>
 	{/if}
 </div>
 

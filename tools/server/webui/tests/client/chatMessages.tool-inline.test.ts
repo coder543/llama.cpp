@@ -6,6 +6,15 @@ import { SETTING_CONFIG_DEFAULT } from '$lib/constants/settings-config';
 import type { ChatRole, DatabaseMessage } from '$lib/types';
 import TestMessagesWrapper from './components/TestMessagesWrapper.svelte';
 
+const waitForText = async (container: HTMLElement, text: string, timeoutMs = 2000) => {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if ((container.textContent || '').includes(text)) return;
+		await new Promise((resolve) => setTimeout(resolve, 16));
+	}
+	throw new Error(`Timed out waiting for text: ${text}`);
+};
+
 // Utility to build a message quickly
 const msg = (
 	id: string,
@@ -93,6 +102,9 @@ describe('ChatMessages inline tool rendering', () => {
 			props: { messages }
 		});
 
+		await waitForText(container, 'Arguments');
+		await waitForText(container, 'Let me calculate that.');
+
 		// One assistant card after collapsing the chain
 		const assistants = container.querySelectorAll('[aria-label="Assistant message with actions"]');
 		expect(assistants.length).toBe(1);
@@ -154,6 +166,10 @@ describe('ChatMessages inline tool rendering', () => {
 			target: document.body,
 			props: { messages }
 		});
+
+		await waitForText(container, 'Arguments');
+		await waitForText(container, 'Here is the answer (before tool).');
+		await waitForText(container, 'And here is the rest (after tool).');
 
 		const assistant = container.querySelector('[aria-label="Assistant message with actions"]');
 		expect(assistant).toBeTruthy();

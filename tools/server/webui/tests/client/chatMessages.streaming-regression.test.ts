@@ -4,6 +4,15 @@ import { conversationsStore } from '$lib/stores/conversations.svelte';
 import TestReactiveMessagesWrapper from './components/TestReactiveMessagesWrapper.svelte';
 import type { ChatRole, DatabaseMessage } from '$lib/types';
 
+const waitForText = async (container: HTMLElement, text: string, timeoutMs = 2000) => {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if ((container.textContent || '').includes(text)) return;
+		await new Promise((resolve) => setTimeout(resolve, 16));
+	}
+	throw new Error(`Timed out waiting for text: ${text}`);
+};
+
 const msg = (
 	id: string,
 	role: ChatRole,
@@ -59,16 +68,14 @@ describe('ChatMessages streaming regression', () => {
 		conversationsStore.addMessageToActive(t1);
 
 		// Let DOM update
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForText(container, 'reasoning-step-1');
 		expect(container.textContent || '').toContain('reasoning-step-1');
 		expect(container.textContent || '').not.toContain('reasoning-step-2');
 		expect(container.textContent || '').not.toContain('final-answer');
 
 		// Phase 2: stream in later reasoning (a2)
 		conversationsStore.addMessageToActive(a2);
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForText(container, 'reasoning-step-2');
 
 		const afterA2 = container.textContent || '';
 		expect(afterA2).toContain('reasoning-step-1'); // old reasoning still present
@@ -76,8 +83,7 @@ describe('ChatMessages streaming regression', () => {
 
 		// Phase 3: final assistant content
 		conversationsStore.addMessageToActive(a3);
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForText(container, 'final-answer');
 
 		const finalText = container.textContent || '';
 		expect(finalText).toContain('final-answer');

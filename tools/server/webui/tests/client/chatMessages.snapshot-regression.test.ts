@@ -4,6 +4,15 @@ import { conversationsStore } from '$lib/stores/conversations.svelte';
 import TestSnapshotMessagesWrapper from './components/TestSnapshotMessagesWrapper.svelte';
 import type { ChatRole, DatabaseMessage } from '$lib/types';
 
+const waitForText = async (container: HTMLElement, text: string, timeoutMs = 2000) => {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if ((container.textContent || '').includes(text)) return;
+		await new Promise((resolve) => setTimeout(resolve, 16));
+	}
+	throw new Error(`Timed out waiting for text: ${text}`);
+};
+
 const msg = (
 	id: string,
 	role: ChatRole,
@@ -59,8 +68,7 @@ describe('ChatMessages snapshot regression', () => {
 		conversationsStore.addMessageToActive(a2);
 		conversationsStore.addMessageToActive(a3);
 
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForText(container, 'final-answer');
 
 		// With a stale snapshot, final-answer will be missing; this expectation enforces correct behavior.
 		expect(container.textContent || '').toContain('final-answer');
