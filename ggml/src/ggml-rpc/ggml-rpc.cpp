@@ -1350,9 +1350,17 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     if (result == nullptr) {
         return nullptr;
     }
-    if (result->buffer == nullptr && result->data != nullptr) {
-        GGML_LOG_ERROR("[%s] invalid data ptr", __func__);
+    const bool unresolved_view = result->buffer == nullptr && result->data != nullptr && tensor->view_src != 0;
+    if (result->buffer == nullptr && result->data != nullptr && !unresolved_view) {
+        GGML_LOG_ERROR("[%s] invalid data ptr: id=%" PRIu64 ", name='%s', op=%s, data=%p, serialized_buffer=%" PRIu64 "\n",
+                __func__, id, result->name, ggml_op_name(result->op), result->data, tensor->buffer);
         return nullptr;
+    }
+    if (unresolved_view) {
+        // The scheduler can send a view whose serialized buffer belongs to a
+        // different backend while its view source is a local RPC copy. Resolve
+        // the source first, then reconstruct and validate the local view below.
+        result->data = nullptr;
     }
     tensor_map[id] = result;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1385,6 +1393,23 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+    if (unresolved_view) {
+        const uint64_t view_size = ggml_nbytes(result);
+        const uint64_t src_data = (uint64_t) result->view_src->data;
+        const uint64_t buffer_base = result->view_src->buffer ?
+            (uint64_t) ggml_backend_buffer_get_base(result->view_src->buffer) : 0;
+        const uint64_t buffer_size = result->view_src->buffer ?
+            (uint64_t) ggml_backend_buffer_get_size(result->view_src->buffer) : 0;
+        if (result->view_src->buffer == nullptr || result->view_src->data == nullptr ||
+            src_data < buffer_base || result->view_offs > buffer_size || view_size > buffer_size - result->view_offs ||
+            src_data - buffer_base > buffer_size - result->view_offs - view_size) {
+            GGML_LOG_ERROR("[%s] failed to resolve view: id=%" PRIu64 ", name='%s', op=%s\n",
+                    __func__, id, result->name, ggml_op_name(result->op));
+            return nullptr;
+        }
+        result->buffer = result->view_src->buffer;
+        result->data = (char *) result->view_src->data + result->view_offs;
+    }
     return result;
 }
 
