@@ -237,15 +237,30 @@ struct ggml_backend_rpc_buffer_context {
 
 // RPC helper functions
 
-// Computes FNV-1a hash of the data
-static uint64_t fnv_hash(const uint8_t * data, size_t len) {
-    const uint64_t fnv_prime = 0x100000001b3ULL;
-    uint64_t hash = 0xcbf29ce484222325ULL;
+// Computes a fast 64-bit MurmurHash2 of the data.
+static uint64_t cache_hash(const uint8_t * data, size_t len) {
+    const uint64_t m = 0xc6a4a7935bd1e995ULL;
+    uint64_t hash = 0xc70f6907ULL ^ (len * m);
+
+    while (len >= sizeof(uint64_t)) {
+        uint64_t block;
+        memcpy(&block, data, sizeof(block));
+        block *= m;
+        block ^= block >> 47;
+        block *= m;
+        hash ^= block;
+        hash *= m;
+        data += sizeof(block);
+        len  -= sizeof(block);
+    }
 
     for (size_t i = 0; i < len; ++i) {
-        hash ^= data[i];
-        hash *= fnv_prime;
+        hash ^= (uint64_t) data[i] << (i * 8);
     }
+    hash *= m;
+    hash ^= hash >> 47;
+    hash *= m;
+    hash ^= hash >> 47;
     return hash;
 }
 
@@ -486,11 +501,11 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    if (size > HASH_THRESHOLD && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
-        request.hash = fnv_hash((const uint8_t*)data, size);
+        request.hash = cache_hash((const uint8_t *) data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
@@ -880,6 +895,7 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::unordered_map<uint64_t, uint64_t> pending_tensor_hashes;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
@@ -1145,8 +1161,11 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
+    const uint64_t cache_key = in_tensor->data + offset;
+    auto pending_hash = pending_tensor_hashes.find(cache_key);
+    if (cache_dir && size > HASH_THRESHOLD && pending_hash != pending_tensor_hashes.end()) {
+        uint64_t hash = pending_hash->second;
+        pending_tensor_hashes.erase(pending_hash);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
         // save to cache_dir/hash_str
@@ -1183,9 +1202,13 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 {
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
+        if (cache_dir) {
+            pending_tensor_hashes[request.tensor.data + request.offset] = request.hash;
+        }
         response.result = 0;
         return true;
     }
+    pending_tensor_hashes.erase(request.tensor.data + request.offset);
     size_t size = cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
