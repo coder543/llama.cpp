@@ -298,6 +298,15 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
+
+    // the nextn (MTP) block is structurally a trunk block: mirror the last trunk
+    // layer's attention and MoE dims into the per-layer arrays, which the generic
+    // loader fills only up to n_layer()
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.n_head_arr[il]     = hparams.n_head_arr[hparams.n_layer() - 1];
+        hparams.n_head_kv_arr[il]  = hparams.n_head_kv_arr[hparams.n_layer() - 1];
+        hparams.n_ff_arr[il]       = hparams.n_ff_arr[hparams.n_layer() - 1];
+    }
 }
 
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
