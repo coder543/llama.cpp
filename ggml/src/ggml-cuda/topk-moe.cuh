@@ -6,6 +6,12 @@
 // Rows that one CUDA block handles.
 #define TOPK_MOE_ROWS_PER_BLOCK 8
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_op_grouped_topk_128(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
+                                  const ggml_tensor * bias, ggml_tensor * ids, ggml_tensor * weights,
+                                  float clamp_min, float scale);
+#endif
+
 struct ggml_cuda_topk_moe_args {
     bool sigmoid{};
     bool sqrt_softplus{};

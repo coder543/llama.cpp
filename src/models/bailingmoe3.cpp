@@ -182,7 +182,10 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
         int64_t n_tokens,
         int64_t cache_head,
         uint32_t mem_size,
-        uint32_t n_rs_seq) {
+        uint32_t n_rs_seq,
+        float norm_eps) {
+    const bool pipeline = getenv("GGML_CUDA_LING_PIPELINE") && n_tokens == 1 && n_seqs == 1;
+    std::vector<ggml_tensor *> snapshots;
     const int64_t d_inner = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t total_state_size = 3 * conv_state_size;
@@ -202,17 +205,36 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
     for (int64_t slot = 0; slot < n_written; ++slot) {
         ggml_tensor * conv_snap = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
                 conv_x->nb[1], conv_x->nb[2], (conv_x->ne[0] - (d_conv - 1) - slot) * conv_x->nb[0]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_snap,
+        ggml_tensor * snapshot = ggml_cpy(ctx0, conv_snap,
                 ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
                     (d_conv - 1) * ggml_element_size(conv_states_all),
                     total_state_size * ggml_element_size(conv_states_all),
-                    ((slot * mem_size + cache_head) * total_state_size + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
+                    ((slot * mem_size + cache_head) * total_state_size + qkv * conv_state_size) * ggml_element_size(conv_states_all)));
+        if (pipeline) {
+            snapshots.push_back(snapshot);
+        } else {
+            ggml_build_forward_expand(gf, snapshot);
+        }
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
     ggml_tensor * out = ggml_ssm_conv(ctx0, conv_x, conv_weight);
-    out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
-    return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs);
+    if (pipeline) {
+        out = ggml_silu(ctx0, out);
+    } else {
+        out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
+    }
+    out = ggml_reshape_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs);
+    if (pipeline) {
+        if (qkv < 2) {
+            out = build_gdn_l2_norm(ctx0, out, norm_eps);
+        }
+        ggml_build_forward_expand(gf, out);
+        for (ggml_tensor * snapshot : snapshots) {
+            ggml_build_forward_expand(gf, snapshot);
+        }
+    }
+    return out;
 }
 
 llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph_params & params) :
@@ -261,13 +283,13 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
 
             ggml_tensor * q = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq, hparams.f_norm_rms_eps);
             ggml_tensor * k = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq, hparams.f_norm_rms_eps);
             ggml_tensor * v = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq, hparams.f_norm_rms_eps);
 
             ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
             gate = ggml_add(ctx0, gate, layer.ssm_dt_b);
@@ -280,8 +302,10 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
             beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs));
 
-            q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
-            k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
+            if (!(getenv("GGML_CUDA_LING_PIPELINE") && n_tokens == 1 && n_seqs == 1)) {
+                q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
+                k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
+            }
 
             ggml_tensor * states_all = mctx_cur->get_s_l(il);
             ggml_tensor * state = build_rs(inp_rs, states_all, hparams.n_embd_s(), n_seqs);
@@ -407,6 +431,7 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
 }
 
 llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :

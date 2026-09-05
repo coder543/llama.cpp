@@ -1,4 +1,63 @@
 #include "mmvq.cuh"
+
+struct ggml_cuda_mmvq_cache {
+    static constexpr size_t slot_bytes = 16384;
+    static constexpr size_t slots = 512;
+    char * data = nullptr;
+    size_t used = 0;
+    std::unordered_map<const ggml_tensor *, int> consumers;
+    std::unordered_map<const ggml_tensor *, char *> ready;
+};
+
+void ggml_cuda_mmvq_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph) {
+    static const bool enabled = getenv("GGML_CUDA_REUSE_QUANT") && atoi(getenv("GGML_CUDA_REUSE_QUANT")) == 1;
+    static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
+    if (!enabled || concurrent) {
+        return;
+    }
+    if (!ctx.mmvq_cache) {
+        ctx.mmvq_cache = new ggml_cuda_mmvq_cache;
+        CUDA_CHECK(cudaMalloc((void **) &ctx.mmvq_cache->data, ggml_cuda_mmvq_cache::slots * ggml_cuda_mmvq_cache::slot_bytes));
+    }
+    auto & cache = *ctx.mmvq_cache;
+    cache.used = 0;
+    cache.ready.clear();
+    cache.consumers.clear();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[1]) {
+            ++cache.consumers[t->src[1]];
+        }
+    }
+}
+
+void ggml_cuda_mmvq_cache_written(ggml_backend_cuda_context & ctx, const ggml_tensor * tensor) {
+    if (!ctx.mmvq_cache || tensor->op == GGML_OP_NONE || tensor->op == GGML_OP_VIEW ||
+        tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_PERMUTE ||
+        ggml_is_empty(tensor)) {
+        return;
+    }
+    auto & cache = *ctx.mmvq_cache;
+    const uintptr_t start = (uintptr_t) tensor->data, end = start + ggml_nbytes(tensor);
+    for (auto it = cache.ready.begin(); it != cache.ready.end();) {
+        const uintptr_t src = (uintptr_t) it->first->data;
+        if (start < src + ggml_nbytes(it->first) && src < end) {
+            it = cache.ready.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ggml_cuda_mmvq_cache_free(ggml_backend_cuda_context & ctx) {
+    if (ctx.mmvq_cache) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaFree(ctx.mmvq_cache->data));
+        delete ctx.mmvq_cache;
+        ctx.mmvq_cache = nullptr;
+    }
+}
+
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1121,6 +1180,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
             use = false;
         }
 
+        static const bool wider_rows = getenv("GGML_CUDA_MMVQ_ROWS") && atoi(getenv("GGML_CUDA_MMVQ_ROWS")) == 1;
+        if (wider_rows && cc == 860 && c_ncols_dst == 1 &&
+            (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) && ncols_x <= 3072 && nrows_x % 4 == 0) {
+            use = true;
+        }
         return use;
     };
 
@@ -1482,12 +1546,31 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t quant_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * quant_data = nullptr;
+    bool reuse = false;
+    auto * cache = ctx.mmvq_cache;
+    if (cache && ctx.curr_stream_no == 0 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+        quant_bytes <= ggml_cuda_mmvq_cache::slot_bytes && cache->consumers[src1] > 1) {
+        auto it = cache->ready.find(src1);
+        if (it != cache->ready.end()) {
+            quant_data = it->second;
+            reuse = true;
+        } else if (cache->used < ggml_cuda_mmvq_cache::slots) {
+            quant_data = cache->data + cache->used++ * ggml_cuda_mmvq_cache::slot_bytes;
+            cache->ready[src1] = quant_data;
+        }
+    }
+    if (!quant_data) {
+        src1_q8_1.alloc(quant_bytes);
+        quant_data = src1_q8_1.get();
+    }
+    if (!reuse) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, quant_data, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1513,7 +1596,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, quant_data, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

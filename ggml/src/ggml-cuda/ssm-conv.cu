@@ -2,6 +2,52 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+template<bool norm>
+static __global__ void ling_conv_cuda(const float * state, const float * projection, const float * weights,
+                                      float * out, float * next_state, float eps) {
+    const int lane = threadIdx.x;
+    const int base = blockIdx.x * 128;
+    float values[4], old1[4], old2[4], newest[4];
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = base + lane + i * 32;
+        const float old0 = state[3*c];
+        old1[i] = state[3*c + 1];
+        old2[i] = state[3*c + 2];
+        newest[i] = projection[c];
+        float value = 0.0f;
+        value += old0 * weights[4*c];
+        value += old1[i] * weights[4*c + 1];
+        value += old2[i] * weights[4*c + 2];
+        value += newest[i] * weights[4*c + 3];
+        value += 0.0f;
+        values[i] = ggml_cuda_op_silu_single(value);
+        sum += values[i] * values[i];
+    }
+    const float scale = norm ? rsqrtf(fmaxf(warp_reduce_sum<32>(sum), eps * eps)) : 1.0f;
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = base + lane + i * 32;
+        out[c] = norm ? values[i] * scale : values[i];
+        next_state[3*c] = old1[i];
+        next_state[3*c + 1] = old2[i];
+        next_state[3*c + 2] = newest[i];
+    }
+}
+
+void ggml_cuda_ling_conv(ggml_backend_cuda_context & ctx, const ggml_tensor * state, const ggml_tensor * projection,
+                         const ggml_tensor * weights, ggml_tensor * out, ggml_tensor * next_state, bool norm, float eps) {
+    if (norm) {
+        ling_conv_cuda<true><<<16, 32, 0, ctx.stream()>>>((const float *) state->data, (const float *) projection->data,
+            (const float *) weights->data, (float *) out->data, (float *) next_state->data, eps);
+    } else {
+        ling_conv_cuda<false><<<16, 32, 0, ctx.stream()>>>((const float *) state->data, (const float *) projection->data,
+            (const float *) weights->data, (float *) out->data, (float *) next_state->data, eps);
+    }
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,

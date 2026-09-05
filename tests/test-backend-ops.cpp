@@ -6636,6 +6636,7 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    const int n_groups;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -6644,17 +6645,19 @@ struct test_topk_moe : public test_case {
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  int                    n_groups        = 1) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        n_groups(n_groups) {
         GGML_ASSERT(n_expert_used <= ne[0]);
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w) + "," + VARS_TO_STR1(n_groups); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6680,6 +6683,18 @@ struct test_topk_moe : public test_case {
             ggml_set_name(exp_probs_b, "exp_probs_b");
             selection_probs = ggml_add(ctx, probs, exp_probs_b);
             ggml_set_name(selection_probs, "selection_probs");
+        }
+
+        if (n_groups > 1) {
+            ggml_tensor * groups = ggml_reshape_3d(ctx, selection_probs, n_expert / n_groups, n_groups, n_tokens);
+            ggml_tensor * top2 = ggml_argsort_top_k(ctx, groups, 2);
+            ggml_tensor * scores = ggml_get_rows(ctx, ggml_reshape_4d(ctx, groups, 1, groups->ne[0], groups->ne[1], groups->ne[2]), top2);
+            scores = ggml_sum_rows(ctx, ggml_reshape_3d(ctx, scores, 2, n_groups, n_tokens));
+            scores = ggml_reshape_2d(ctx, scores, n_groups, n_tokens);
+            ggml_tensor * group_ids = ggml_argsort_top_k(ctx, scores, n_groups / 2);
+            ggml_tensor * selected = ggml_get_rows(ctx, groups, group_ids);
+            selection_probs = ggml_set_rows(ctx, ggml_fill(ctx, groups, -INFINITY), selected, group_ids);
+            selection_probs = ggml_reshape_2d(ctx, selection_probs, n_expert, n_tokens);
         }
 
         selected_experts = ggml_argsort_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
@@ -6716,6 +6731,9 @@ struct test_topk_moe : public test_case {
 
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
+        if (n_groups > 1) {
+            return nmse(a, b, n);
+        }
         std::vector<float> a2(n);
         std::vector<float> b2(n);
         for (size_t i = 0; i < n; ++i) {
@@ -10735,6 +10753,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+
+    for (int64_t n_expert : {64, 128}) {
+        for (int64_t n_tokens : {1, 2, 8}) {
+            test_cases.emplace_back(new test_topk_moe({n_expert, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 2.5f, 8));
+        }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {

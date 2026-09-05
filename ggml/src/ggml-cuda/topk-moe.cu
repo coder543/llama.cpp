@@ -5,6 +5,94 @@
 #include <cmath>
 #include <initializer_list>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template<int N>
+static __device__ void grouped_topk_sort(float & value, int & index, float * values, int * indices) {
+    const int col = threadIdx.x;
+    const int local_col = col & (N - 1);
+#pragma unroll
+    for (int k = 2; k <= N; k *= 2) {
+#pragma unroll
+        for (int j = k / 2; j > 0; j /= 2) {
+            float other_value;
+            int other_index;
+            if (j < 32) {
+                other_value = __shfl_xor_sync(0xffffffff, value, j);
+                other_index = __shfl_xor_sync(0xffffffff, index, j);
+            } else {
+                values[col] = value;
+                indices[col] = index;
+                __syncthreads();
+                other_value = values[col ^ j];
+                other_index = indices[col ^ j];
+                __syncthreads();
+            }
+            const bool lower = (local_col & j) == 0;
+            const float lo = lower ? value : other_value;
+            const float hi = lower ? other_value : value;
+            const bool swap = (local_col & k) == 0 ? lo < hi : lo > hi;
+            if (swap) {
+                value = other_value;
+                index = other_index;
+            }
+        }
+    }
+}
+
+static __global__ void grouped_topk_128_cuda(const float * logits, const float * bias,
+                                            int * ids, float * weights, float clamp_min, float scale) {
+    const int col = threadIdx.x;
+    __shared__ float probs[128], scores[128], values[128], group_scores[8];
+    __shared__ int indices[128], keep[8];
+
+    const float prob = 1.0f / (1.0f + expf(-logits[col]));
+    const float score = prob + bias[col];
+    probs[col] = prob;
+    scores[col] = score;
+    if (col < 8) {
+        keep[col] = 0;
+    }
+    // Read both inputs before any output write, since graph buffers can alias.
+    __syncthreads();
+
+    float value = score;
+    int index = col;
+    grouped_topk_sort<16>(value, index, values, indices);
+    values[col] = value;
+    __syncthreads();
+    if (col < 8) {
+        group_scores[col] = values[col * 16] + values[col * 16 + 1];
+    }
+    __syncthreads();
+    value = group_scores[col & 7];
+    index = col & 7;
+    grouped_topk_sort<8>(value, index, values, indices);
+    if (col < 4) {
+        keep[index] = 1;
+    }
+    __syncthreads();
+
+    value = keep[col / 16] ? scores[col] : -INFINITY;
+    index = col;
+    grouped_topk_sort<128>(value, index, values, indices);
+    if (col < 32) {
+        const float weight = col < 8 ? probs[index] : 0.0f;
+        const float sum = warp_reduce_sum(weight);
+        if (col < 8) {
+            ids[col] = index;
+            weights[col] = (weight / fmaxf(sum, clamp_min)) * scale;
+        }
+    }
+}
+
+void ggml_cuda_op_grouped_topk_128(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
+                                  const ggml_tensor * bias, ggml_tensor * ids, ggml_tensor * weights,
+                                  float clamp_min, float scale) {
+    grouped_topk_128_cuda<<<1, 128, 0, ctx.stream()>>>((const float *) logits->data,
+        (const float *) bias->data, (int *) ids->data, (float *) weights->data, clamp_min, scale);
+}
+#endif
+
 // Kernel config struct - passed by value to CUDA kernel
 struct topk_moe_config {
     bool use_sigmoid;

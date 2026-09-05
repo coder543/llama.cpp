@@ -163,6 +163,69 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
     b = tmp;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template<ggml_sort_order order, int ncols_pad>
+static __global__ void k_argsort_small_f32_i32(const float * x, int * dst, const int ncols) {
+    const int col = threadIdx.x;
+    const int row = blockIdx.x;
+    int idx = col;
+    float val = col < ncols ? x[row * ncols + col] : 0.0f;
+    __shared__ int indices[ncols_pad];
+    __shared__ float values[ncols_pad];
+
+#pragma unroll
+    for (int k = 2; k <= ncols_pad; k *= 2) {
+#pragma unroll
+        for (int j = k / 2; j > 0; j /= 2) {
+            int other_idx;
+            float other_val;
+            if (j < 32) {
+                other_idx = __shfl_xor_sync(0xffffffff, idx, j);
+                other_val = __shfl_xor_sync(0xffffffff, val, j);
+            } else {
+                indices[col] = idx;
+                values[col] = val;
+                __syncthreads();
+                other_idx = indices[col ^ j];
+                other_val = values[col ^ j];
+                __syncthreads();
+            }
+            const bool lower = (col & j) == 0;
+            const bool forward = (col & k) == 0;
+            const int lo_idx = lower ? idx : other_idx;
+            const int hi_idx = lower ? other_idx : idx;
+            const float lo = lower ? val : other_val;
+            const float hi = lower ? other_val : val;
+            const bool swap = forward ?
+                (lo_idx >= ncols || (hi_idx < ncols && (order == GGML_SORT_ORDER_ASC ? lo > hi : lo < hi))) :
+                (hi_idx >= ncols || (lo_idx < ncols && (order == GGML_SORT_ORDER_ASC ? lo < hi : lo > hi)));
+            if (swap) {
+                idx = other_idx;
+                val = other_val;
+            }
+        }
+    }
+    if (col < ncols) {
+        dst[row * ncols + col] = idx;
+    }
+}
+
+template<ggml_sort_order order>
+static void argsort_small_f32_i32(const float * x, int * dst, int ncols, int nrows, int ncols_pad, cudaStream_t stream) {
+    switch (ncols_pad) {
+        case 1: k_argsort_small_f32_i32<order, 1><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 2: k_argsort_small_f32_i32<order, 2><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 4: k_argsort_small_f32_i32<order, 4><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 8: k_argsort_small_f32_i32<order, 8><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 16: k_argsort_small_f32_i32<order, 16><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 32: k_argsort_small_f32_i32<order, 32><<<nrows, 32, 0, stream>>>(x, dst, ncols); break;
+        case 64: k_argsort_small_f32_i32<order, 64><<<nrows, 64, 0, stream>>>(x, dst, ncols); break;
+        case 128: k_argsort_small_f32_i32<order, 128><<<nrows, 128, 0, stream>>>(x, dst, ncols); break;
+    }
+}
+
+#endif
+
 template<ggml_sort_order order>
 static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     // bitonic sort
@@ -229,6 +292,18 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   cudaStream_t    stream) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool small_sort = getenv("GGML_CUDA_SMALL_SORT") && atoi(getenv("GGML_CUDA_SMALL_SORT")) == 1;
+    if (ncols_pad <= 128 && small_sort) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            argsort_small_f32_i32<GGML_SORT_ORDER_ASC>(x, dst, ncols, nrows, ncols_pad, stream);
+        } else {
+            argsort_small_f32_i32<GGML_SORT_ORDER_DESC>(x, dst, ncols, nrows, ncols_pad, stream);
+        }
+        return;
+    }
+#endif
 
     const dim3 block_dims(ncols_pad, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
