@@ -278,6 +278,14 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        if constexpr (ncols == 1) {
+            // Each warp accumulates its own keys and values. A fully masked group contributes zero.
+            if (mask && ne32 > 1 && max_bias == 0.0f && k_VKQ_max - k_VKQ_0 >= nthreads &&
+                    ggml_cuda_all(__half2float(maskh[tid]) == -INFINITY)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 

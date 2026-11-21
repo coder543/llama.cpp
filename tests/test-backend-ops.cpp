@@ -9384,6 +9384,28 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Decode with holes in different warp-sized groups per head, including a partly visible group.
+struct test_flash_attn_ext_mask_holes : public test_flash_attn_ext {
+    test_flash_attn_ext_mask_holes(int kv, bool sinks) :
+        test_flash_attn_ext(64, 64, 2, {4, 1}, kv, 1, true, sinks, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, 0, 8) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + ",mask_holes=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        auto * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        for (int64_t h = 0; h < mask_heads; ++h) {
+            for (int64_t k = 0; k < kv; ++k) {
+                const bool visible = (k + 11*h) % 127 < 33 && !(sinks && h == 0);
+                data[h*kv + k] = ggml_fp32_to_fp16(visible ? 0.125f*(k % 7) : -INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13608,6 +13630,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
 
+    for (bool sinks : {false, true}) {
+        for (int kv : {1024, 1025}) {
+            test_cases.emplace_back(new test_flash_attn_ext_mask_holes(kv, sinks));
+        }
+    }
     // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) with sinks
     for (int hs : {64, 80, 128, 256}) {
         for (int nq : {1, 3, 35}) {
