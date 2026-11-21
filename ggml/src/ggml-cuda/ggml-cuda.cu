@@ -4465,6 +4465,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Dense one-to-one kernels can write over an entire input, but not a shifted view of it.
+static bool ggml_cuda_disjoint_or_same(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t x = (uintptr_t) a->data;
+    const uintptr_t y = (uintptr_t) b->data;
+    return x == y || (x < y ? y - x >= ggml_nbytes(a) : x - y >= ggml_nbytes(b));
+}
+
+// x * clamp(limit / (sqrt(sum_rows(sqr(x))) + eps), 0, 1)
+static bool ggml_cuda_match_clip_norm(const ggml_cgraph * graph, int i, int device) {
+    if (!ggml_can_fuse_subgraph(graph, i, {
+                GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL }, { i + 7 })) {
+        return false;
+    }
+    ggml_tensor ** ops = graph->nodes + i;
+    const auto * x = ops[0]->src[0];
+    const auto * dst = ops[7];
+    // Do not elide a write to an intermediate view (in particular, an in-place FILL).
+    if (std::any_of(ops, ops + 7, [](const ggml_tensor * t) { return t->view_src != nullptr; })) {
+        return false;
+    }
+    const bool connected = ops[1]->src[0] == ops[0] && ops[2]->src[0] == ops[1] && ops[3]->src[0] == ops[2] &&
+                           ops[4]->src[0] == ops[3] && ops[5]->src[0] == ops[4] && ops[5]->src[1] == ops[3] &&
+                           ops[6]->src[0] == ops[5] && dst->src[0] == x && dst->src[1] == ops[6];
+    const bool unit_clamp = ggml_get_op_params_f32(ops[6], 0) == 0.0f && ggml_get_op_params_f32(ops[6], 1) == 1.0f;
+    return connected && unit_clamp && ggml_get_op_params_f32(ops[3], 0) == 1.0f &&
+           x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_are_same_shape(x, dst) &&
+           ggml_is_contiguous(x) && ggml_is_contiguous(dst) && ggml_cuda_disjoint_or_same(x, dst) &&
+           x->ne[0] <= 512 && ggml_nrows(x) < 2*ggml_cuda_info().devices[device].nsm;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4473,6 +4504,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SQR && ggml_cuda_match_clip_norm(cgraph, i, cuda_ctx->device)) {
+        ggml_tensor ** ops = cgraph->nodes + i;
+        ggml_cuda_op_clip_norm(*cuda_ctx, node->src[0], ops[7], ggml_get_op_params_f32(ops[3], 1), ggml_get_op_params_f32(ops[4], 0));
+        return 7;
+    }
+
+    if (node->op == GGML_OP_ADD && ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_SCALE })) {
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        ggml_tensor * dst = cgraph->nodes[i + 1];
+        if (!node->view_src && dst->src[0] == node &&
+            a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(a, b) && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst) &&
+            ggml_cuda_disjoint_or_same(a, dst) && ggml_cuda_disjoint_or_same(b, dst)) {
+            ggml_cuda_op_add_scale(*cuda_ctx, node, dst);
+            return 1;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

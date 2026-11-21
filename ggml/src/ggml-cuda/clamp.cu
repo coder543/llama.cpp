@@ -1,5 +1,28 @@
 #include "clamp.cuh"
 
+static __global__ void clip_norm_f32(const float * src, float * dst, int cols, float eps, float limit) {
+    const int col = threadIdx.x;
+    const int64_t offset = int64_t(blockIdx.x)*cols + col;
+    ggml_cuda_pdl_sync();
+    const float x = col < cols ? src[offset] : 0.0f;
+    __shared__ float sums[32];
+    __shared__ float factor;
+    const float sum = block_reduce<block_reduce_method::SUM>(x*x, sums);
+    if (col == 0) {
+        factor = fminf(fmaxf(limit/(sqrtf(sum) + eps), 0.0f), 1.0f);
+    }
+    __syncthreads();
+    if (col < cols) {
+        dst[offset] = x*factor;
+    }
+}
+
+void ggml_cuda_op_clip_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, float eps, float limit) {
+    // Match the small-row SUM_ROWS reduction tree before broadcasting lane zero's result.
+    const ggml_cuda_kernel_launch_params launch(ggml_nrows(src), 512, 0, ctx.stream());
+    ggml_cuda_kernel_launch(clip_norm_f32, launch, (const float *)src->data, (float *)dst->data, (int)src->ne[0], eps, limit);
+}
+
 static __device__ __forceinline__ float op_clamp(float x, float min, float max) {
     return fminf(fmaxf(x, min), max);
 }

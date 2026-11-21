@@ -104,7 +104,7 @@ static __global__ void k_get_rows_float(
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
-        const int64_t ne00v,
+        const int64_t ne00v, const int64_t ne10,
         const int64_t ne11, const uint3 ne12_fdv,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
@@ -112,8 +112,11 @@ static __global__ void k_get_rows_float_vec(
 
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
+    const int64_t i10 = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
+    if (i10 >= ne10) {
+        return;
+    }
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
-        const int i10 = blockIdx.x;
         const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
         const int i11 = dm.x;
         const int i12 = dm.y;
@@ -266,12 +269,13 @@ static void get_rows_cuda_float(
             (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
 
         if (can_vec) {
-            const int block_num_y = vec_block_num_y;
-            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+            // Pack narrow rows into a block when there are many indices to gather.
+            const dim3 threads = ne00v <= 8 && ne10 >= 1024 ? dim3(8, CUDA_GET_ROWS_BLOCK_SIZE/8) : block_dims;
+            const dim3 block_nums((ne10 + threads.y - 1)/threads.y, MIN(vec_block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, threads, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
-                ne00v, ne11, ne12_fdv,
+                ne00v, ne10, ne11, ne12_fdv,
                 s1, s2, s3,
                 nb01, nb02, nb03,
                 s10, s11, s12);

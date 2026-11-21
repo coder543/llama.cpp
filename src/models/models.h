@@ -2507,7 +2507,13 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        struct mix_bank {
+            ggml_tensor * states;
+            ggml_tensor * transposed;
+        };
+        mix_bank build_mix_bank(ggml_tensor * blocks, ggml_tensor * cur);
+        ggml_tensor * mix(const mix_bank & bank, ggml_tensor * query);
+        ggml_tensor * mix(ggml_tensor * blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2518,6 +2524,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 llm_graph_input_rs * inp,
                 int64_t offset);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * build_relative_mask(ggml_tensor * table, ggml_tensor * distances, int il);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2527,14 +2534,17 @@ struct llama_model_inkling2 : public llama_model_base {
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
         // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
-        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, ggml_tensor * & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        void build_output(ggml_tensor * cur, ggml_tensor * blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
 
+        ggml_tensor * mask_f32[2] = {}; // full and sliding-window masks
+        ggml_tensor * zero_sinks = nullptr;
+        std::vector<ggml_tensor *> padded_rel_bias;
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
     };

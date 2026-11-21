@@ -3,6 +3,22 @@
 
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
+static __global__ void add_scale_f32(const float * a, const float * b, float * dst, int64_t n, float scale, float bias) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    if (i < n) {
+        dst[i] = scale*(a[i] + b[i]) + bias;
+    }
+}
+
+void ggml_cuda_op_add_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params launch((n + CUDA_SCALE_BLOCK_SIZE - 1)/CUDA_SCALE_BLOCK_SIZE, CUDA_SCALE_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(add_scale_f32, launch, (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+            (float *) dst->data, n, ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1));
+}
+
 // src and dst may be views: rows are contiguous, dims 1..3 follow the strides (in elements).
 template <typename T>
 static __global__ void scale_f32(const T * x, T * dst, const float scale, const float bias, const uint32_t k,

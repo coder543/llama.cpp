@@ -3781,6 +3781,24 @@ struct test_add_id : public test_case {
 };
 
 // GGML_OP_SCALE
+struct test_add_scale : public test_case {
+    const bool inplace;
+    const bool reuse_sum;
+
+    test_add_scale(bool inplace, bool reuse_sum) : inplace(inplace), reuse_sum(reuse_sum) {}
+    std::string op_desc(ggml_tensor *) override { return "ADD_SCALE"; }
+    std::string vars() override { return VARS_TO_STR2(inplace, reuse_sum); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 3);
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 3);
+        auto * sum = ggml_add(ctx, a, b);
+        auto * scaled = inplace ? ggml_scale_bias_inplace(ctx, sum, 0.7f, -0.1f)
+                                : ggml_scale_bias(ctx, sum, 0.7f, -0.1f);
+        return reuse_sum ? ggml_add(ctx, scaled, sum) : scaled;
+    }
+};
+
 struct test_scale : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -6416,6 +6434,23 @@ struct test_cos : public test_case {
 };
 
 // GGML_OP_CLAMP
+struct test_clip_norm : public test_case {
+    const int cols;
+    const float limit;
+
+    test_clip_norm(int cols, float limit) : cols(cols), limit(limit) {}
+    std::string op_desc(ggml_tensor *) override { return "CLIP_NORM"; }
+    std::string vars() override { return VARS_TO_STR2(cols, limit); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, 4, 3);
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * ratio = ggml_div(ctx, ggml_fill(ctx, norm, limit), norm);
+        return ggml_mul(ctx, x, ggml_clamp(ctx, ratio, 0.0f, 1.0f));
+    }
+};
+
 struct test_clamp : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10895,6 +10930,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    for (int rows : {1023, 1024, 1025}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 24, 97, rows, 2, 3));
+    }
+    // Both the index and source views are strided; the index view has 1025 entries per batch.
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 24, 97, 2050, 2, 3, true, true, 4));
+    for (int cols : {32, 97, 512, 513}) {
+        for (float limit : {0.5f, 32.0f}) {
+            test_cases.emplace_back(new test_clip_norm(cols, limit));
+        }
+    }
+    test_cases.emplace_back(new test_add_scale(false, false));
+    test_cases.emplace_back(new test_add_scale(true, false));
+    test_cases.emplace_back(new test_add_scale(false, true));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
