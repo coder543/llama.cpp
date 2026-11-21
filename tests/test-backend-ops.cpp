@@ -2570,11 +2570,11 @@ struct test_get_rows : public test_case {
 };
 
 struct test_relative_mask : public test_get_rows {
-    const bool padded, sinks;
-    test_relative_mask(int queries, int streams, bool padded, bool sinks = false)
-        : test_get_rows(GGML_TYPE_F32, 7, 17, 257, queries, streams), padded(padded), sinks(sinks) {}
+    const bool padded, sinks, tile;
+    test_relative_mask(int queries, int streams, bool padded, bool sinks = false, bool tile = false)
+        : test_get_rows(GGML_TYPE_F32, 7, 17, 257, queries, streams), padded(padded), sinks(sinks), tile(tile) {}
     std::string op_desc(ggml_tensor *) override { return "RELATIVE_MASK"; }
-    std::string vars() override { return VARS_TO_STR4(be1, be2, padded, sinks); }
+    std::string vars() override { return VARS_TO_STR5(be1, be2, padded, sinks, tile); }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2588,9 +2588,10 @@ struct test_relative_mask : public test_get_rows {
             table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, m, be1, be2);
         }
         auto * bias = ggml_reshape_4d(ctx, ggml_get_rows(ctx, table, rows), n, r, be1, be2);
-        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, r + padded, be1, 1, be2);
-        if (padded) {
-            mask = ggml_view_4d(ctx, mask, r, be1, 1, be2, mask->nb[1], mask->nb[2], mask->nb[3], sizeof(float));
+        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, r + padded, be1 + tile, 1, be2);
+        if (padded || tile) {
+            size_t offset = (tile ? mask->nb[1] : 0) + (padded ? sizeof(float) : 0);
+            mask = ggml_view_4d(ctx, mask, r, be1, 1, be2, mask->nb[1], mask->nb[2], mask->nb[3], offset);
         }
         bias = ggml_add(ctx, bias, ggml_permute(ctx, mask, 1, 2, 0, 3));
         return ggml_cast(ctx, ggml_permute(ctx, bias, 2, 0, 1, 3), GGML_TYPE_F16);
@@ -11047,6 +11048,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_relative_mask(3, 1, true));
     test_cases.emplace_back(new test_relative_mask(3, 1, false, true));
     test_cases.emplace_back(new test_relative_mask(1, 1, false, true));
+    test_cases.emplace_back(new test_relative_mask(3, 1, false, false, true));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));

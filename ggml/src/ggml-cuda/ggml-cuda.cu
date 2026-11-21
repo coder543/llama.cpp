@@ -4576,11 +4576,13 @@ static int ggml_cuda_match_relative_mask(const ggml_cgraph * graph, int i, ggml_
         return 0;
     }
     auto ** ops = graph->nodes + j;
-    const int view = ops[2]->op == GGML_OP_PERMUTE ? 1 : 0;
-    const int nodes[] = { j-3, j-2, j-1, j, j+1, j+2+view, j+3+view, j+4+view };
+    // A query tile takes a view of the shared mask before permuting it for ADD.
+    const bool tile = ops[2]->op == GGML_OP_VIEW && ops[3]->op == GGML_OP_PERMUTE && ops[3]->src[0] == ops[2];
+    const int mask_views = tile ? 2 : int(ops[2]->op == GGML_OP_PERMUTE);
+    const int nodes[] = { j-3, j-2, j-1, j, j+1, j+2+mask_views, j+3+mask_views, j+4+mask_views };
     const int first = subtract ? 0 : 3;
     const int last = nodes[7];
-    if (!ggml_can_fuse_subgraph_ext(graph, nodes+first, 8-first, pattern+first, &last, 1)) {
+    if (last >= graph->n_nodes || !ggml_can_fuse_subgraph_ext(graph, nodes+first, 8-first, pattern+first, &last, 1)) {
         return 0;
     }
 
@@ -4592,7 +4594,7 @@ static int ggml_cuda_match_relative_mask(const ggml_cgraph * graph, int i, ggml_
     auto * mask          = add->src[1];
     auto * dst = graph->nodes[last];
     if (ops[1]->src[0] != gather || !ggml_are_same_shape(ops[1], gather) ||
-        add->src[0] != ops[1] || add->view_src || (view && mask != ops[2]) ||
+        add->src[0] != ops[1] || add->view_src || (mask_views && mask != ops[1+mask_views]) ||
         perm->src[0] != add || dst->src[0] != perm || dst->src[1] != dst ||
         table->type != GGML_TYPE_F32 || indices->type != GGML_TYPE_I32 ||
         mask->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F16 || dst->ne[3] != 1 ||
