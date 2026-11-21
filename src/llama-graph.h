@@ -1541,18 +1541,15 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // A per-head mask including the learned relative bias.
+    using build_mha_fn = std::function<ggml_tensor *(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v)>;
+
+    // Relative attention shares the KV cache setup with standard ISWA attention.
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
-            ggml_tensor * wo,
-            ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_mask,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
-                  float   kq_scale,
+     const build_mha_fn & build_mha,
                     int   il) const;
 
     //

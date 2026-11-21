@@ -2525,6 +2525,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 int64_t offset);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
         ggml_tensor * build_relative_mask(ggml_tensor * table, ggml_tensor * distances, int il);
+        ggml_tensor * build_relative_mha(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                ggml_tensor * table, ggml_tensor * distances, float scale, int il);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2542,6 +2544,11 @@ struct llama_model_inkling2 : public llama_model_base {
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
 
+        struct mask_tile {
+            ggml_tensor * distances = nullptr;
+            ggml_tensor * causal = nullptr;
+        };
+        std::map<std::pair<int64_t, int64_t>, mask_tile> mask_tiles[2];
         ggml_tensor * mask_f32[2] = {}; // full and sliding-window masks
         ggml_tensor * zero_sinks = nullptr;
         std::vector<ggml_tensor *> padded_rel_bias;

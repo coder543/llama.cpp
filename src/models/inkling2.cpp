@@ -207,10 +207,10 @@ ggml_tensor * llama_model_inkling2::graph::build_relative_mask(ggml_tensor * tab
     const int64_t n_stream = mask->ne[3];
     const int64_t n_query  = mask->ne[1];
 
-    // Only the mask construction needs tiling. Flash attention still sees the complete
-    // queries and mask, independent of the scratch space used to build it.
+    // Bound the gather size and the number of tile nodes per layer.
     constexpr int64_t max_bias_elements = 1LL << 26;
-    constexpr int64_t max_tiles = 16;
+    const int64_t head_groups = (hparams.n_head(il) + n_head - 1)/n_head;
+    const int64_t max_tiles = std::min<int64_t>(16, std::max<int64_t>(1, 64/head_groups));
     int64_t tile = n_query;
     // ARANGE below represents integer row indices exactly up through 2^24.
     if (n_stream == 1 && cparams.flash_attn && !cparams.training && n_query <= (1 << 24)) {
@@ -220,20 +220,27 @@ ggml_tensor * llama_model_inkling2::graph::build_relative_mask(ggml_tensor * tab
     if (tile < n_query) {
         // A graph operation gives this layer reusable scratch storage. A fresh leaf
         // tensor here would reserve a separate full-size mask for every global layer.
-        result = ggml_repeat_4d(ctx0, mask, n_kv, n_query, n_head, 1);
+        result = ggml_repeat_4d(ctx0, ggml_view_1d(ctx0, mask, 1, 0), n_kv, n_query, n_head, 1);
     }
     table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-    mask = mask_f32[is_swa];
 
     for (int64_t first = 0; first < n_query; first += tile) {
         const int64_t count = std::min(tile, n_query - first);
         auto * values = table;
         auto * indices = distances;
-        auto * raw = mask;
+        auto * raw = mask_f32[is_swa];
         if (result) {
             values = ggml_view_3d(ctx0, table, n_head, table->ne[1], count, table->nb[1], table->nb[2], first*table->nb[2]);
-            indices = ggml_view_2d(ctx0, distances, n_kv, count, distances->nb[1], first*distances->nb[1]);
-            raw = ggml_view_2d(ctx0, mask, n_kv, count, mask->nb[1], first*mask->nb[1]);
+            // Share copies of the host inputs across heads and layers.
+            auto & views = mask_tiles[is_swa][{ first, count }];
+            if (!views.distances) {
+                views.distances = ggml_view_2d(ctx0, distances, n_kv, count, distances->nb[1], first*distances->nb[1]);
+                views.causal = ggml_view_2d(ctx0, mask, n_kv, count, mask->nb[1], first*mask->nb[1]);
+            }
+            indices = views.distances;
+            raw = views.causal->type == GGML_TYPE_F32 ? views.causal : ggml_cast(ctx0, views.causal, GGML_TYPE_F32);
+            // Keep the mask cast before the gather/add/cast fusion.
+            ggml_build_forward_expand(gf, raw);
         }
         ggml_tensor * bias = ggml_get_rows(ctx0, values, indices);
         bias = ggml_reshape_4d(ctx0, bias, n_head, n_kv, count, n_stream);
@@ -247,6 +254,45 @@ ggml_tensor * llama_model_inkling2::graph::build_relative_mask(ggml_tensor * tab
         // Write each tile straight to its final rows before computing the next one.
         ggml_tensor * rows = ggml_cast(ctx0, ggml_arange(ctx0, first, first + count, 1), GGML_TYPE_I32);
         result = ggml_set_rows(ctx0, result, bias, rows);
+        ggml_build_forward_expand(gf, result);
+    }
+    return result;
+}
+
+ggml_tensor * llama_model_inkling2::graph::build_relative_mha(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * table, ggml_tensor * distances, float scale, int il) {
+    const int64_t heads = q->ne[1];
+    const int64_t kv_heads = k->ne[1];
+    const int64_t heads_per_kv = heads/kv_heads;
+    auto attend = [&](ggml_tensor * qs, ggml_tensor * ks, ggml_tensor * vs, ggml_tensor * values, ggml_tensor * sinks) {
+        auto * mask = build_relative_mask(values, distances, il);
+        cb(mask, "kq_mask_rel_pos", il);
+        return build_attn_mha(qs, ks, vs, nullptr, mask, nullptr, sinks, nullptr, 0, scale, il);
+    };
+
+    // Each group uses complete query rows and its own KV heads. Reuse the mask between groups.
+    constexpr int64_t max_mask_elements = (1LL << 30)/sizeof(ggml_fp16_t);
+    int64_t group = std::max<int64_t>(1, max_mask_elements/k->ne[2]/q->ne[2]/heads_per_kv);
+    if (group >= kv_heads || !cparams.flash_attn || cparams.training || k->ne[3] != 1) {
+        return attend(q, k, v, table, zero_sinks);
+    }
+
+    // Equal head groups can reuse the same query tiles.
+    while (kv_heads % group != 0) {
+        --group;
+    }
+    auto slice_heads = [&](ggml_tensor * t, int64_t first, int64_t count) {
+        return ggml_view_3d(ctx0, t, t->ne[0], count, t->ne[2], t->nb[1], t->nb[2], first*t->nb[1]);
+    };
+    ggml_tensor * result = nullptr;
+    for (int64_t first = 0; first < kv_heads; first += group) {
+        const int64_t q0 = first*heads_per_kv;
+        const int64_t nq = group*heads_per_kv;
+        auto * sinks = ggml_view_1d(ctx0, zero_sinks, nq, q0*zero_sinks->nb[0]);
+        auto * part = attend(slice_heads(q, q0, nq), slice_heads(k, first, group), slice_heads(v, first, group),
+                             slice_heads(table, q0, nq), sinks);
+        // Copy out of Flash Attention's workspace before constructing the next mask.
+        result = result ? ggml_concat(ctx0, result, part, 0) : ggml_dup(ctx0, part);
         ggml_build_forward_expand(gf, result);
     }
     return result;
@@ -453,8 +499,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (!zero_sinks || zero_sinks->ne[0] != n_head) {
             zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
         }
-        auto * mask = build_relative_mask(table, rel_pos, il);
-        cur = build_attn(inp, nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, mask, zero_sinks, 1.0f/sqrtf(n_embd_head), il);
+        cur = build_attn(inp, Qcur, Kcur, Vcur,
+                [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) {
+                    return build_relative_mha(q, k, v, table, rel_pos, 1.0f/sqrtf(n_embd_head), il);
+                }, il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

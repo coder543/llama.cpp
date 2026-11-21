@@ -3765,6 +3765,7 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 // the iswa build_attn with the KQ mask and kv_rows given by the caller, which has to keep them in sync
+template<typename BuildMha>
 static ggml_tensor * build_attn_iswa_impl(
         const llm_graph_context & gctx,
         llm_graph_input_attn_kv_iswa * inp,
@@ -3774,13 +3775,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_b,
-        ggml_tensor * kq_mask,
-        ggml_tensor * kv_rows,
-        ggml_tensor * sinks,
-        ggml_tensor * v_mla,
-            float     kq_scale,
-            int       il) {
+            int       il,
+        const BuildMha & build_mha) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3846,7 +3842,7 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_mha(q, k, v);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -3887,7 +3883,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.raw  : inp->self_attn_mask.raw;
     const auto & kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
 
-    return build_attn_iswa_impl(*this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, kq_mask, kv_rows, sinks, v_mla, kq_scale, il);
+    return build_attn_iswa_impl(*this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, il,
+            [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) {
+                return build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+            });
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -4480,15 +4479,10 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
-        ggml_tensor * wo,
-        ggml_tensor * wo_b,
-        ggml_tensor * wo_s,
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_mask,
-        ggml_tensor * sinks,
-            float     kq_scale,
+        const build_mha_fn & build_mha,
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
 
@@ -4500,9 +4494,7 @@ ggml_tensor * llm_graph_context::build_attn(
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    cb(kq_mask, "kq_mask_rel_pos", il);
-
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    return build_attn_iswa_impl(*this, inp_attn, nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, il, build_mha);
 }
 
 void llm_graph_context::build_dense_out(
