@@ -4476,6 +4476,63 @@ static bool ggml_cuda_disjoint_or_same(const ggml_tensor * a, const ggml_tensor 
     return a->data == b->data || ggml_cuda_disjoint(a, b);
 }
 
+// Single-token, four-tap convolution with a residual and a rolling state write.
+static int ggml_cuda_try_fuse_ssm_conv_step(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (i + 6 >= graph->n_nodes || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    auto ** ops = graph->nodes + i;
+    const int last = i + 6 + int(ops[6]->op == GGML_OP_VIEW);
+    const int nodes[] = { i, i+1, i+2, i+3, i+4, i+5, last };
+    const int outputs[] = { i+4, last };
+    constexpr ggml_op pattern[] = { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD,
+                                    GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_CPY };
+    if (last >= graph->n_nodes || !ggml_can_fuse_subgraph_ext(graph, nodes, 7, pattern, outputs, 2)) {
+        return 0;
+    }
+    const auto * window = ops[0];
+    const auto * conv = ops[1];
+    const auto * add = ops[3];
+    auto * out = ops[4];
+    const auto * tail = ops[5];
+    auto * state = graph->nodes[last];
+    const auto * past = window->src[0];
+    const auto * step = window->src[1];
+    const auto * w = conv->src[1];
+    const auto * residual = add->src[0];
+    if (ggml_get_op_params_i32(window, 0) != 0 || conv->src[0] != window || ops[2]->src[0] != conv ||
+        add->src[1] != ops[2] || add->view_src || out->src[0] != add || out->view_src ||
+        tail->src[0] != window || tail->view_offs != sizeof(float) || state->src[0] != tail ||
+        state->src[1] == state || (last == i+7 && state->src[1] != ops[6])) {
+        return 0;
+    }
+    const int64_t channels = past->ne[1], seqs = past->ne[2];
+    if (past->type != GGML_TYPE_F32 || step->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        residual->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 || !ggml_is_3d(past) ||
+        past->ne[0] != 3 || step->ne[0] != 1 || channels < 1 || channels > INT32_MAX || seqs < 1 || seqs > 65535 ||
+        w->ne[0] != 4 || !ggml_is_contiguous(w) || !ggml_are_same_shape(tail, past) ||
+        past->nb[0] != sizeof(float) || past->nb[1] != 3*sizeof(float) ||
+        tail->nb[0] != sizeof(float) || tail->nb[1] != window->nb[1] || (seqs > 1 && tail->nb[2] != window->nb[2]) ||
+        step->nb[1] != sizeof(float) || (seqs > 1 && step->nb[2] != channels*sizeof(float)) ||
+        !ggml_is_matrix(out) || out->ne[0] != channels || out->ne[1] != seqs || !ggml_is_contiguous(out) ||
+        !ggml_are_same_shape(residual, out) || !ggml_are_same_shape(ops[2], out) || !ggml_is_contiguous(residual) ||
+        !ggml_is_matrix(state) || state->ne[0] != 3*channels || state->ne[1] != seqs || state->nb[0] != sizeof(float) ||
+        (seqs > 1 && (past->nb[2] % sizeof(float) || state->nb[1] % sizeof(float) || state->nb[1] < 3*channels*sizeof(float)))) {
+        return 0;
+    }
+    for (const auto * t : { past, step, w, residual }) {
+        if (!ggml_cuda_disjoint(t, state)) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_disjoint(out, state) || !ggml_cuda_disjoint(past, out) || !ggml_cuda_disjoint(w, out) ||
+        !ggml_cuda_disjoint_or_same(step, out) || !ggml_cuda_disjoint_or_same(residual, out)) {
+        return 0;
+    }
+    ggml_cuda_op_ssm_conv_step(ctx, window, conv, residual, out, state);
+    return last - i;
+}
+
 static bool ggml_cuda_match_gated_residual(const ggml_cgraph * graph, int i, int device) {
     auto ** ops = graph->nodes + i;
     const auto * x = ops[0]->src[1];
@@ -4664,6 +4721,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CONCAT) {
+        if (const int skip = ggml_cuda_try_fuse_ssm_conv_step(*cuda_ctx, cgraph, i)) {
+            return skip;
+        }
+    }
 
     if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SUB) {
         ggml_cuda_relative_mask_match m;

@@ -2,6 +2,46 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+static __global__ void ssm_conv_step_f32(const float * history, const float * step, const float * weights, const float * residual,
+        float * out, float * state, int64_t channels, size_t history_stride, size_t state_stride, float scale, float bias) {
+    ggml_cuda_pdl_lc();
+    const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t seq = blockIdx.y;
+    ggml_cuda_pdl_sync();
+    if (c >= channels) {
+        return;
+    }
+
+    const float * past = history + seq*history_stride + 3*c;
+    const float * w = weights + 4*c;
+    const int64_t i = seq*channels + c;
+    const float x = step[i];
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        sum = fmaf(past[j], w[j], sum);
+    }
+    // The unfused convolution adds its zero bias before the residual.
+    sum = fmaf(x, w[3], sum) + 0.0f;
+    out[i] = scale*(residual[i] + sum) + bias;
+    float * next = state + seq*state_stride + 3*c;
+    next[0] = past[1];
+    next[1] = past[2];
+    next[2] = x;
+}
+
+void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, const ggml_tensor * window, const ggml_tensor * conv,
+        const ggml_tensor * residual, ggml_tensor * out, ggml_tensor * state) {
+    const auto * history = window->src[0];
+    constexpr int threads = 128;
+    const dim3 grid((history->ne[1] + threads - 1)/threads, history->ne[2]);
+    const ggml_cuda_kernel_launch_params launch(grid, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ssm_conv_step_f32, launch, (const float *) history->data, (const float *) window->src[1]->data,
+            (const float *) conv->src[1]->data, (const float *) residual->data, (float *) out->data, (float *) state->data,
+            history->ne[1], history->nb[2]/sizeof(float), state->nb[1]/sizeof(float),
+            ggml_get_op_params_f32(out, 0), ggml_get_op_params_f32(out, 1));
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,
