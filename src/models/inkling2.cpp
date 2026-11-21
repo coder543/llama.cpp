@@ -175,11 +175,10 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 }
 
 auto llama_model_inkling2::graph::build_mix_bank(ggml_tensor * blocks, ggml_tensor * cur) -> mix_bank {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * states = ggml_reshape_3d(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), n_embd, 1, n_tokens);
     if (blocks) {
         states = ggml_concat(ctx0, blocks, states, 1);
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
     return { states, ggml_cont(ctx0, ggml_transpose(ctx0, states)) };
 }
 
@@ -444,7 +443,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (!padded_rel_bias[ip]) {
             padded_rel_bias[ip] = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         }
-        ggml_tensor * table = ggml_mul_mat(ctx0, padded_rel_bias[ip], Rcur);
+        // Every head and token uses the same left-hand matrix.
+        ggml_tensor * rel = ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens);
+        ggml_tensor * table = ggml_mul_mat(ctx0, padded_rel_bias[ip], rel);
+        table = ggml_reshape_3d(ctx0, table, table->ne[0], n_head, n_tokens);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
@@ -461,8 +463,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
-        // Completed blocks are immutable. Keep them in mixing order, newest first.
-        ggml_tensor * block = ggml_reshape_3d(ctx0, inpSA, n_embd, 1, n_tokens);
+        // All subsequent mixes read the same normalized row for each completed block.
+        ggml_tensor * block = ggml_reshape_3d(ctx0, ggml_rms_norm(ctx0, inpSA, 1e-6f), n_embd, 1, n_tokens);
         blocks = blocks ? ggml_concat(ctx0, block, blocks, 1) : block;
     } else {
         cur = ggml_add(ctx0, inpSA, cur);
