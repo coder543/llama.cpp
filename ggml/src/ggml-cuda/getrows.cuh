@@ -12,4 +12,7 @@ void get_rows_cuda(
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_relative_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * table, const ggml_tensor * indices,
+        const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

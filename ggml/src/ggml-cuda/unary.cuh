@@ -43,6 +43,9 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_in, const ggml_tensor * gate_out,
+        const ggml_tensor * up_in, const ggml_tensor * up_out, ggml_tensor * dst);
+
 void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

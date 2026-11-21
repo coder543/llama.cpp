@@ -287,8 +287,17 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
             ggml_tensor * tap    = ggml_view_3d(ctx0, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag*dynamic->nb[0]);
             ggml_tensor * window = ggml_view_3d(ctx0, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
 
-            window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
-            window = ggml_reshape_3d(ctx0, window, n_channels/n_heads, n_heads, n_tokens);
+            if (n_seq_tokens == 1) {
+                // One token per sequence: a singleton time dimension lets MUL read
+                // the strided channels where they are, with no transposed copy.
+                const int64_t head_dim = n_channels/n_heads;
+                window = ggml_view_4d(ctx0, window, 1, head_dim, n_heads, n_seqs,
+                        window->nb[1], head_dim*window->nb[1], window->nb[2], 0);
+                tap = ggml_view_4d(ctx0, tap, 1, 1, n_heads, n_seqs, tap->nb[0], tap->nb[1], tap->nb[2], 0);
+            } else {
+                window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
+                window = ggml_reshape_3d(ctx0, window, n_channels/n_heads, n_heads, n_tokens);
+            }
 
             ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, window, tap), n_channels, n_tokens);
 
@@ -301,7 +310,12 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    // The controller normalizes each half separately. One row per half lets the
+    // backend normalize both vectors together for every token in the batch.
+    ggml_tensor * gate = ggml_concat(ctx0, cur, message, 0);
+    gate = ggml_reshape_3d(ctx0, gate, n_embd, 2, n_tokens);
+    gate = ggml_rms_norm(ctx0, gate, 1e-6f);
+    gate = ggml_reshape_2d(ctx0, gate, 2*n_embd, n_tokens);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
@@ -365,8 +379,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+        for (int j = 0; j < (is_swa ? 1 : 3); ++j) {
+            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
+        }
+        if (is_swa) {
+            inputs[1] = inputs[2] = inputs[0];
         }
     }
 

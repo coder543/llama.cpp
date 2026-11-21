@@ -2569,6 +2569,34 @@ struct test_get_rows : public test_case {
     }
 };
 
+struct test_relative_mask : public test_get_rows {
+    const bool padded, sinks;
+    test_relative_mask(int queries, int streams, bool padded, bool sinks = false)
+        : test_get_rows(GGML_TYPE_F32, 7, 17, 257, queries, streams), padded(padded), sinks(sinks) {}
+    std::string op_desc(ggml_tensor *) override { return "RELATIVE_MASK"; }
+    std::string vars() override { return VARS_TO_STR4(be1, be2, padded, sinks); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        ggml_tensor * table;
+        if (sinks) {
+            table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, m, n, be1, be2);
+            auto * s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n, be1, be2);
+            table = ggml_cont(ctx, ggml_permute(ctx, ggml_sub(ctx, table, s), 1, 0, 2, 3));
+        } else {
+            table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, m, be1, be2);
+        }
+        auto * bias = ggml_reshape_4d(ctx, ggml_get_rows(ctx, table, rows), n, r, be1, be2);
+        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, r + padded, be1, 1, be2);
+        if (padded) {
+            mask = ggml_view_4d(ctx, mask, r, be1, 1, be2, mask->nb[1], mask->nb[2], mask->nb[3], sizeof(float));
+        }
+        bias = ggml_add(ctx, bias, ggml_permute(ctx, mask, 1, 2, 0, 3));
+        return ggml_cast(ctx, ggml_permute(ctx, bias, 2, 0, 1, 3), GGML_TYPE_F16);
+    }
+};
+
 // GGML_OP_GET_ROWS on a weight also used by GGML_OP_MUL_MAT (tied embeddings)
 // that the preceding mul_mat may have put in the SYCL reorder layout. The
 // mul_mat runs first, so a backend that changes the weight layout in place
@@ -3777,6 +3805,66 @@ struct test_add_id : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+struct test_gated_residual : public test_case {
+    const int cols, tokens;
+    const bool reuse, check_rounding;
+    test_gated_residual(int cols, int tokens, bool reuse, bool check_rounding = false)
+        : cols(cols), tokens(tokens), reuse(reuse), check_rounding(check_rounding) {}
+    std::string op_desc(ggml_tensor *) override { return "GATED_RESIDUAL"; }
+    std::string vars() override { return VARS_TO_STR4(cols, tokens, reuse, check_rounding); }
+    bool run_whole_graph() override { return true; }
+    double err(const float * a, const float * b, size_t n) override {
+        return check_rounding ? !std::equal(a, a+n, b) : test_case::err(a, b, n);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int rows = 129;
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, tokens);
+        auto * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, tokens);
+        auto * msg = ggml_dup_tensor(ctx, cur);
+        auto * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, rows);
+        auto * wg = ggml_dup_tensor(ctx, wf);
+        auto residual = [&](bool materialize) {
+            auto * f = ggml_mul_mat(ctx, wf, x);
+            auto * g = ggml_mul_mat(ctx, wg, x);
+            if (materialize) {
+                ggml_set_output(f);
+            }
+            auto * keep = ggml_sub(ctx, cur, ggml_mul(ctx, ggml_tanh(ctx, f), cur));
+            auto * out = ggml_add(ctx, keep, ggml_mul(ctx, ggml_tanh(ctx, g), msg));
+            return reuse ? ggml_add(ctx, out, f) : out;
+        };
+        auto * out = residual(false);
+        // On each backend the fused calculation must subtract to zero against its own unfused reference.
+        return check_rounding ? ggml_sub(ctx, out, residual(true)) : out;
+    }
+};
+
+struct test_situ : public test_case {
+    const bool packed, reuse, inplace;
+    test_situ(bool packed, bool reuse, bool inplace) : packed(packed), reuse(reuse), inplace(inplace) {}
+    std::string op_desc(ggml_tensor *) override { return "SITU"; }
+    std::string vars() override { return VARS_TO_STR3(packed, reuse, inplace); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int cols = 65;
+        auto * base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, packed ? 2*cols : cols, 3, 2, 3);
+        auto slice = [&](size_t offset) {
+            return ggml_view_4d(ctx, base, cols, 3, 2, 3, base->nb[1], base->nb[2], base->nb[3], offset);
+        };
+        auto * gate = packed ? slice(0) : base;
+        // In the in-place case both branches observe the first SCALE through overlapping views.
+        auto * up = packed ? slice((inplace ? 1 : cols)*sizeof(float)) : ggml_dup_tensor(ctx, base);
+        auto * g = inplace ? ggml_scale_bias_inplace(ctx, gate, 0.125f, -0.1f) : ggml_scale_bias(ctx, gate, 0.125f, -0.1f);
+        auto * capped = ggml_scale_bias(ctx, ggml_tanh(ctx, g), 8.0f, 0.2f);
+        auto * act = ggml_mul(ctx, capped, ggml_sigmoid(ctx, gate));
+        auto * u = ggml_scale_bias(ctx, up, 0.25f, 0.15f);
+        auto * out = ggml_mul(ctx, act, ggml_scale_bias(ctx, ggml_tanh(ctx, u), 4.0f, -0.3f));
+        return reuse ? ggml_add(ctx, out, act) : out;
     }
 };
 
@@ -10943,6 +11031,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_add_scale(false, false));
     test_cases.emplace_back(new test_add_scale(true, false));
     test_cases.emplace_back(new test_add_scale(false, true));
+    for (int cols : { 62, 64, 66 }) {
+        test_cases.emplace_back(new test_gated_residual(cols, 1, false));
+    }
+    test_cases.emplace_back(new test_gated_residual(64, 3, false));
+    test_cases.emplace_back(new test_gated_residual(64, 1, true));
+    test_cases.emplace_back(new test_gated_residual(64, 1, false, true));
+    test_cases.emplace_back(new test_situ(false, false, false));
+    test_cases.emplace_back(new test_situ(true, false, false));
+    test_cases.emplace_back(new test_situ(true, true, false));
+    test_cases.emplace_back(new test_situ(true, false, true));
+    test_cases.emplace_back(new test_relative_mask(1, 1, false));
+    test_cases.emplace_back(new test_relative_mask(3, 1, false));
+    test_cases.emplace_back(new test_relative_mask(3, 2, false));
+    test_cases.emplace_back(new test_relative_mask(3, 1, true));
+    test_cases.emplace_back(new test_relative_mask(3, 1, false, true));
+    test_cases.emplace_back(new test_relative_mask(1, 1, false, true));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));

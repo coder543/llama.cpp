@@ -2,6 +2,42 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+// Gather the per-query bias and add the shared mask directly in the layout
+// consumed by flash attention: [key, query, head].
+template<bool subtract_sinks>
+static __global__ void relative_mask_f16(const float * table, const int32_t * indices, const float * mask, const float * sinks,
+        half * dst, int64_t keys, int64_t buckets) {
+    ggml_cuda_pdl_sync();
+    const int64_t key = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (key < keys) {
+        const int64_t query = blockIdx.y;
+        const int64_t head  = blockIdx.z;
+        const int64_t row   = query*keys + key;
+        float bias;
+        if constexpr (subtract_sinks) {
+            const int64_t qh = query*gridDim.z + head;
+            bias = table[qh*buckets + indices[row]] - sinks[qh];
+        } else {
+            bias = table[(query*buckets + indices[row])*gridDim.z + head];
+        }
+        dst[(head*gridDim.y + query)*keys + key] = ggml_cuda_cast<half>(bias + mask[row]);
+    }
+}
+
+void ggml_cuda_op_relative_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * table, const ggml_tensor * indices,
+        const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    constexpr int threads = 128;
+    const dim3 grid((dst->ne[0] + threads - 1)/threads, dst->ne[1], dst->ne[2]);
+    const ggml_cuda_kernel_launch_params launch(grid, threads, 0, ctx.stream());
+    if (sinks) {
+        ggml_cuda_kernel_launch(relative_mask_f16<true>, launch, (const float *) table->data, (const int32_t *) indices->data,
+            (const float *) mask->data, (const float *) sinks->data, (half *) dst->data, dst->ne[0], table->ne[0]);
+    } else {
+        ggml_cuda_kernel_launch(relative_mask_f16<false>, launch, (const float *) table->data, (const int32_t *) indices->data,
+            (const float *) mask->data, nullptr, (half *) dst->data, dst->ne[0], table->ne[1]);
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,

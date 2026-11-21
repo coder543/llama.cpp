@@ -49,6 +49,37 @@ static __device__ __forceinline__ float op_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+static __device__ __forceinline__ float situ_softcap(float x, float2 in, float2 out) {
+    return out.x*tanhf(in.x*x + in.y) + out.y;
+}
+
+static __global__ void situ_f32(const float * gate, const float * up, float * dst, uint32_t count,
+        uint3 width, size_t gate_stride, size_t up_stride, float2 gate_in, float2 gate_out, float2 up_in, float2 up_out) {
+    ggml_cuda_pdl_sync();
+    const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < count) {
+        const uint2 rc = fast_div_modulo(i, width);
+        const float g = gate[rc.x*gate_stride + rc.y];
+        const float u = up[rc.x*up_stride + rc.y];
+        dst[i] = (situ_softcap(g, gate_in, gate_out)*op_sigmoid(g)) * situ_softcap(u, up_in, up_out);
+    }
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_in, const ggml_tensor * gate_out,
+        const ggml_tensor * up_in, const ggml_tensor * up_out, ggml_tensor * dst) {
+    auto scale_bias = [](const ggml_tensor * t) {
+        return make_float2(ggml_get_op_params_f32(t, 0), ggml_get_op_params_f32(t, 1));
+    };
+    const auto * gate = gate_in->src[0];
+    const auto * up   = up_in->src[0];
+    const int64_t n = ggml_nelements(dst);
+    constexpr int threads = 256;
+    const ggml_cuda_kernel_launch_params launch((n + threads - 1)/threads, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(situ_f32, launch, (const float *) gate->data, (const float *) up->data, (float *) dst->data,
+        (uint32_t) n, init_fastdiv_values(dst->ne[0]), gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float),
+        scale_bias(gate_in), scale_bias(gate_out), scale_bias(up_in), scale_bias(up_out));
+}
+
 static __device__ __forceinline__ float op_hardsigmoid(float x) {
     return fminf(1.0f, fmaxf(0.0f, (x + 3.0f) / 6.0f));
 }

@@ -5,6 +5,52 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
+// Two narrow F32 projections share a vector. Keep the same two products per lane
+// and warp reduction as MMVF, then apply the gates before writing the residual.
+static __global__ void gated_residual_f32(const float * wf, const float * wg, const float * x,
+        const float * cur, const float * message, float * dst, int cols, int64_t rows) {
+    ggml_cuda_pdl_sync();
+    const int lane = threadIdx.x;
+    const int64_t row = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
+    if (row >= rows) {
+        return;
+    }
+
+    float forget = 0.0f;
+    float gain   = 0.0f;
+    const int col = 2*lane;
+    if (col < cols) {
+        const int64_t i = row*cols + col;
+        ggml_cuda_mad(forget, wf[i],   x[col]);
+        ggml_cuda_mad(forget, wf[i+1], x[col+1]);
+        ggml_cuda_mad(gain,   wg[i],   x[col]);
+        ggml_cuda_mad(gain,   wg[i+1], x[col+1]);
+    }
+    forget = warp_reduce_sum<WARP_SIZE>(forget);
+    gain   = warp_reduce_sum<WARP_SIZE>(gain);
+    if (lane == 0) {
+        // Adding negative zero in fmaf rounds each product (including signed zero)
+        // before the SUB and ADD, as in the separate MUL nodes.
+        const float c = cur[row];
+        const float dropped = fmaf(tanhf(forget), c, -0.0f);
+        const float added   = fmaf(tanhf(gain), message[row], -0.0f);
+        dst[row] = (c - dropped) + added;
+    }
+}
+
+void ggml_cuda_op_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * forget,
+        const ggml_tensor * gain, const ggml_tensor * cur, const ggml_tensor * message, ggml_tensor * dst) {
+    const auto * wf = forget->src[0];
+    const auto * wg = gain->src[0];
+    const auto * x = forget->src[1];
+    constexpr int rows_per_block = 4;
+    const ggml_cuda_kernel_launch_params launch((dst->ne[0] + rows_per_block - 1)/rows_per_block,
+        dim3(WARP_SIZE, rows_per_block), 0, ctx.stream());
+    ggml_cuda_kernel_launch(gated_residual_f32, launch, (const float *) wf->data, (const float *) wg->data,
+        (const float *) x->data, (const float *) cur->data, (const float *) message->data,
+        (float *) dst->data, (int) x->ne[0], dst->ne[0]);
+}
+
 static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
 #if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     return ggml_cuda_cast<float2>(reinterpret_cast<const __nv_fp8x2_e4m3 *>(x)[col2]);

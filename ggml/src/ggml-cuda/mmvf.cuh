@@ -12,3 +12,6 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+void ggml_cuda_op_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * forget,
+        const ggml_tensor * gain, const ggml_tensor * cur, const ggml_tensor * message, ggml_tensor * dst);

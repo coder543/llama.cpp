@@ -4465,11 +4465,169 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// Dense one-to-one kernels can write over an entire input, but not a shifted view of it.
-static bool ggml_cuda_disjoint_or_same(const ggml_tensor * a, const ggml_tensor * b) {
+static bool ggml_cuda_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
     const uintptr_t x = (uintptr_t) a->data;
     const uintptr_t y = (uintptr_t) b->data;
-    return x == y || (x < y ? y - x >= ggml_nbytes(a) : x - y >= ggml_nbytes(b));
+    return x < y ? y - x >= ggml_nbytes(a) : x - y >= ggml_nbytes(b);
+}
+
+// Dense one-to-one kernels can write over an entire input, but not a shifted view of it.
+static bool ggml_cuda_disjoint_or_same(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->data == b->data || ggml_cuda_disjoint(a, b);
+}
+
+static bool ggml_cuda_match_gated_residual(const ggml_cgraph * graph, int i, int device) {
+    auto ** ops = graph->nodes + i;
+    const auto * x = ops[0]->src[1];
+    if (!ggml_is_vector(x) || x->ne[0] < 1 || x->ne[0] > 2*WARP_SIZE || x->ne[0] % 2 != 0 ||
+        ggml_cuda_info().devices[device].warp_size != WARP_SIZE ||
+        !ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                    GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 7 })) {
+        return false;
+    }
+
+    const auto * wf = ops[0]->src[0];
+    const auto * wg = ops[4]->src[0];
+    const auto * cur = ops[2]->src[1];
+    const auto * message = ops[6]->src[1];
+    const auto * dst = ops[7];
+    if (ggml_get_op_params_i32(ops[0], 1) != GGML_HINT_NONE || ggml_get_op_params_i32(ops[4], 1) != GGML_HINT_NONE ||
+        ops[4]->src[1] != x || ggml_get_unary_op(ops[1]) != GGML_UNARY_OP_TANH ||
+        ggml_get_unary_op(ops[5]) != GGML_UNARY_OP_TANH || ops[1]->src[0] != ops[0] ||
+        ops[2]->src[0] != ops[1] || ops[3]->src[0] != cur || ops[3]->src[1] != ops[2] ||
+        ops[5]->src[0] != ops[4] || ops[6]->src[0] != ops[5] ||
+        dst->src[0] != ops[3] || dst->src[1] != ops[6]) {
+        return false;
+    }
+
+    for (const auto * t : { wf, wg, x, cur, message, dst }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    return ggml_is_matrix(wf) && ggml_are_same_shape(wf, wg) && ggml_is_vector(dst) && wf->ne[1] == dst->ne[0] &&
+           dst->ne[0] > 0 && dst->ne[0] <= INT32_MAX &&
+           ggml_are_same_shape(cur, dst) && ggml_are_same_shape(message, dst) &&
+           std::all_of(ops, ops + 7, [](const ggml_tensor * t) { return t->view_src == nullptr; }) &&
+           ggml_cuda_disjoint(wf, dst) && ggml_cuda_disjoint(wg, dst) && ggml_cuda_disjoint(x, dst) &&
+           ggml_cuda_disjoint_or_same(cur, dst) && ggml_cuda_disjoint_or_same(message, dst);
+}
+
+// SiTU applies a sigmoid to the gate and softcaps both projections before multiplying.
+static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    constexpr ggml_op pattern[] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    if (i + 8 >= graph->n_nodes || graph->nodes[i+1]->op != GGML_OP_UNARY) {
+        return 0;
+    }
+    // A merged gate/up projection can introduce a metadata-only view between the two branches.
+    const int view = graph->nodes[i+5]->op == GGML_OP_VIEW ? 1 : 0;
+    const int nodes[] = { i, i+1, i+2, i+3, i+4, i+5+view, i+6+view, i+7+view, i+8+view };
+    const int last = nodes[8];
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 9, pattern, &last, 1)) {
+        return 0;
+    }
+
+    auto ** g = graph->nodes + i;
+    auto ** u = graph->nodes + nodes[5];
+    const auto * gate = g[0]->src[0];
+    const auto * up   = u[0]->src[0];
+    auto * dst = u[3];
+    if ((view && up != g[5]) || ggml_get_unary_op(g[1]) != GGML_UNARY_OP_TANH ||
+        ggml_get_unary_op(g[3]) != GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(u[1]) != GGML_UNARY_OP_TANH ||
+        g[1]->src[0] != g[0] || g[2]->src[0] != g[1] || g[3]->src[0] != gate ||
+        g[4]->src[0] != g[2] || g[4]->src[1] != g[3] || u[1]->src[0] != u[0] || u[2]->src[0] != u[1] ||
+        dst->src[0] != g[4] || dst->src[1] != u[2]) {
+        return 0;
+    }
+    for (const int index : nodes) {
+        const auto * t = graph->nodes[index];
+        if (t->type != GGML_TYPE_F32 || (t != dst && t->view_src)) {
+            return 0;
+        }
+    }
+    if (!ggml_is_contiguous(dst) || ggml_nelements(dst) > UINT32_MAX) {
+        return 0;
+    }
+    for (const auto * t : { gate, up }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, dst) || !ggml_is_contiguous_1(t) ||
+            !(ggml_cuda_disjoint(t, dst) || (t->data == dst->data && ggml_is_contiguous(t)))) {
+            return 0;
+        }
+    }
+    ggml_cuda_op_situ(ctx, g[0], g[2], u[0], u[2], dst);
+    return last - i;
+}
+
+struct ggml_cuda_relative_mask_match {
+    ggml_tensor * table;
+    ggml_tensor * indices;
+    ggml_tensor * mask;
+    ggml_tensor * sinks;
+    ggml_tensor * dst;
+};
+
+static int ggml_cuda_match_relative_mask(const ggml_cgraph * graph, int i, ggml_cuda_relative_mask_match & match) {
+    constexpr ggml_op pattern[] = { GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+                                    GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CPY };
+    const bool subtract = graph->nodes[i]->op == GGML_OP_SUB;
+    const int j = subtract ? i+3 : i;
+    if (j + 4 >= graph->n_nodes || graph->nodes[j]->op != GGML_OP_GET_ROWS || graph->nodes[j+1]->op != GGML_OP_RESHAPE) {
+        return 0;
+    }
+    auto ** ops = graph->nodes + j;
+    const int view = ops[2]->op == GGML_OP_PERMUTE ? 1 : 0;
+    const int nodes[] = { j-3, j-2, j-1, j, j+1, j+2+view, j+3+view, j+4+view };
+    const int first = subtract ? 0 : 3;
+    const int last = nodes[7];
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes+first, 8-first, pattern+first, &last, 1)) {
+        return 0;
+    }
+
+    const auto * gather  = ops[0];
+    auto * table         = gather->src[0];
+    auto * indices       = gather->src[1];
+    const auto * add     = graph->nodes[nodes[5]];
+    const auto * perm    = graph->nodes[nodes[6]];
+    auto * mask          = add->src[1];
+    auto * dst = graph->nodes[last];
+    if (ops[1]->src[0] != gather || !ggml_are_same_shape(ops[1], gather) ||
+        add->src[0] != ops[1] || add->view_src || (view && mask != ops[2]) ||
+        perm->src[0] != add || dst->src[0] != perm || dst->src[1] != dst ||
+        table->type != GGML_TYPE_F32 || indices->type != GGML_TYPE_I32 ||
+        mask->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F16 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(table) || !ggml_is_contiguous(indices) || !ggml_is_contiguous(dst)) {
+        return 0;
+    }
+    const int64_t keys = indices->ne[0], queries = indices->ne[1], heads = table->ne[0];
+    const bool output_layout = dst->ne[0] == keys && dst->ne[1] == queries && dst->ne[2] == heads &&
+        perm->nb[0] == add->nb[1] && perm->nb[1] == add->nb[2] && perm->nb[2] == add->nb[0];
+    const bool mask_layout = mask->ne[0] == 1 && mask->ne[1] == keys && mask->ne[2] == queries &&
+        mask->ne[3] == 1 && mask->nb[1] == sizeof(float) && (queries == 1 || mask->nb[2] == keys*sizeof(float));
+    if (!output_layout || !mask_layout || indices->ne[2] != 1 || queries < 1 || queries > 65535 || heads < 1 || heads > 65535 ||
+        keys < 1 || keys > INT32_MAX) {
+        return 0;
+    }
+    ggml_tensor * sinks = nullptr;
+    if (subtract) {
+        const auto * sub = graph->nodes[i];
+        const auto * transpose = graph->nodes[i+1];
+        if (table != graph->nodes[i+2] || table->src[0] != transpose || !ggml_are_same_shape(table, transpose) ||
+            transpose->src[0] != sub || sub->view_src ||
+            transpose->nb[0] != sub->nb[1] || transpose->nb[1] != sub->nb[0] || transpose->nb[2] != sub->nb[2]) {
+            return 0;
+        }
+        table = sub->src[0];
+        sinks = sub->src[1];
+        if (table->type != GGML_TYPE_F32 || sinks->type != GGML_TYPE_F32 ||
+            table->ne[1] != heads || table->ne[2] != queries || table->ne[3] != 1 ||
+            sinks->ne[0] != 1 || sinks->ne[1] != heads || sinks->ne[2] != queries || sinks->ne[3] != 1 ||
+            !ggml_is_contiguous(table) || !ggml_is_contiguous(sinks)) {
+            return 0;
+        }
+    }
+    match = { table, indices, mask, sinks, dst };
+    return last - i;
 }
 
 // x * clamp(limit / (sqrt(sum_rows(sqr(x))) + eps), 0, 1)
@@ -4504,6 +4662,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SUB) {
+        ggml_cuda_relative_mask_match m;
+        const int skip = ggml_cuda_match_relative_mask(cgraph, i, m);
+        if (skip && ggml_cuda_disjoint(m.table, m.dst) && ggml_cuda_disjoint(m.indices, m.dst) &&
+            ggml_cuda_disjoint(m.mask, m.dst) && (!m.sinks || ggml_cuda_disjoint(m.sinks, m.dst))) {
+            ggml_cuda_op_relative_mask(*cuda_ctx, m.table, m.indices, m.mask, m.sinks, m.dst);
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_SCALE) {
+        if (const int skip = ggml_cuda_try_fuse_situ(*cuda_ctx, cgraph, i)) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_match_gated_residual(cgraph, i, cuda_ctx->device)) {
+        ggml_tensor ** ops = cgraph->nodes + i;
+        ggml_cuda_op_gated_residual(*cuda_ctx, ops[0], ops[4], ops[2]->src[1], ops[6]->src[1], ops[7]);
+        return 7;
+    }
 
     if (node->op == GGML_OP_SQR && ggml_cuda_match_clip_norm(cgraph, i, cuda_ctx->device)) {
         ggml_tensor ** ops = cgraph->nodes + i;
@@ -5739,6 +5919,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_SUB || cgraph->nodes[i]->op == GGML_OP_GET_ROWS) {
+                ggml_cuda_relative_mask_match m;
+                if (const int skip = ggml_cuda_match_relative_mask(cgraph, i, m)) {
+                    // The gather reads the table, indices and shared mask until the final F16 write.
+                    for (auto * input : { m.table, m.indices, m.mask, m.sinks }) {
+                        if (input) {
+                            params->add_alloc_dep(params->user_data, input, m.dst);
+                        }
+                    }
+                    i += skip;
+                    continue;
+                }
+            }
+
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];
