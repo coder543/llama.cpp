@@ -961,6 +961,15 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t n_channels;
+    int32_t n_tokens;
+    uint64_t history_stride;
+    uint64_t state_stride;
+    float scale;
+    float bias;
+} ggml_metal_kargs_ssm_conv_state;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;
@@ -1081,8 +1090,9 @@ typedef struct {
 typedef struct {
     int32_t n_kv;
     int32_t n_query;
-    int32_t table_stride;
-    int32_t n_bucket;
+    uint64_t nb_head;
+    uint64_t nb_bucket;
+    uint64_t nb_query;
 } ggml_metal_kargs_rel_mask;
 
 typedef struct {
@@ -1097,6 +1107,22 @@ typedef struct {
     uint64_t up_stride;
     float gate_in, gate_out, up_in, up_out;
 } ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t n_cols;
+    uint64_t cur_stride;
+    uint64_t msg_stride;
+} ggml_metal_kargs_gated_residual;
+
+typedef struct {
+    int32_t n_inner;
+    int32_t n_rows;
+    int32_t n_cols;
+    uint64_t nb00;
+    uint64_t nb02;
+    uint64_t nb11;
+    uint64_t nb12;
+} ggml_metal_kargs_cont_mul_mat;
 
 typedef struct {
     int32_t  nk0;

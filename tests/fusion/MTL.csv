@@ -156,7 +156,8 @@ hy_v4               ,0   ,any     ,MUL+ADD                     ,      2
 hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v4               ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      1
-inkling2            ,0   ,any     ,GET_ROWS+ADD+CPY            ,      3
+inkling2            ,0   ,any     ,CONT+GET_ROWS+ADD+CPY       ,      3
+inkling2            ,0   ,any     ,CONT+MUL_MAT                ,      6
 inkling2            ,0   ,any     ,MUL+ADD                     ,      6
 inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
 inkling2            ,0   ,any     ,SCALE+UNARY+SCALE+UNARY+MUL+SCALE+UNARY+SCALE+MUL,      3
@@ -234,6 +235,7 @@ minicpm             ,0   ,any     ,MUL+ADD                     ,      4
 minicpm             ,0   ,any     ,RMS_NORM+MUL                ,      5
 minicpm             ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 minicpm3            ,0   ,any     ,RMS_NORM+MUL                ,      9
+minimax-01          ,0   ,decode  ,CONT+MUL_MAT                ,      1
 minimax-01          ,0   ,any     ,MUL+ADD                     ,      4
 minimax-01          ,0   ,any     ,RMS_NORM+MUL                ,      6
 minimax-01          ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2

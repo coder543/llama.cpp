@@ -1,5 +1,24 @@
 #include "common.h"
 #include "dequantize.h"
+
+kernel void kernel_cont_mul_mat_f32(
+        constant ggml_metal_kargs_cont_mul_mat & args,
+        device const char * src0,
+        device const char * src1,
+        device float * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(args.n_rows)) {
+        return;
+    }
+    device const char * a = src0 + gid.z*args.nb02 + gid.x*sizeof(float);
+    device const float * b = (device const float *)(src1 + gid.z*args.nb12 + gid.y*args.nb11);
+    float sum = 0.0f;
+    for (int k = 0; k < args.n_inner; ++k) {
+        sum += *(device const float *)(a + k*args.nb00)*b[k];
+    }
+    dst[(ulong(gid.z)*args.n_cols + gid.y)*args.n_rows + gid.x] = sum;
+}
+
 // Q1_0 dot product: dot = d * (2 * Σ(yl[i] where bit=1) - sumy)
 inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thread float * yl, int il) {
     device const uint8_t * qs = qb_curr->qs + il / 8;

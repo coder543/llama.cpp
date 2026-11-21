@@ -22,17 +22,19 @@ inline bfloat4 ggml_metal_unary_cast<bfloat4, float>(float x) {
 #endif
 
 kernel void kernel_gated_residual_f32(
-        constant int & count,
+        constant ggml_metal_kargs_gated_residual & args,
         device const float * forget,
         device const float * gain,
         device const float * cur,
         device const float * msg,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid < uint(count)) {
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x < uint(args.n_cols)) {
         #pragma clang fp contract(off)
-        const float keep = cur[gid] - precise::tanh(forget[gid])*cur[gid];
-        dst[gid] = keep + precise::tanh(gain[gid])*msg[gid];
+        const ulong i = ulong(gid.y)*args.n_cols + gid.x;
+        const float x = cur[gid.y*args.cur_stride + gid.x];
+        const float keep = x - precise::tanh(forget[i])*x;
+        dst[i] = keep + precise::tanh(gain[i])*msg[gid.y*args.msg_stride + gid.x];
     }
 }
 

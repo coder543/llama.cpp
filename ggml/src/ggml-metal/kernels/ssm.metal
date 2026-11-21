@@ -3,6 +3,43 @@
 constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
 constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
 
+// Four taps, with the three preceding samples kept in the recurrent state.
+kernel void kernel_ssm_conv_state_f32(
+        constant ggml_metal_kargs_ssm_conv_state & args,
+        device const char * history,
+        device const float * cur,
+        device const packed_float4 * weights,
+        device float * dst,
+        device char * state,
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    if (c >= uint(args.n_channels)) {
+        return;
+    }
+    const uint t0 = 8*gid.y;
+    const ulong first = ulong(gid.z)*args.n_tokens*args.n_channels + c;
+    const ulong nc = args.n_channels;
+    float3 past;
+    if (t0 == 0) {
+        past = ((device const packed_float3 *)(history + gid.z*args.history_stride))[c];
+    } else {
+        past = float3(cur[first + (t0-3)*nc], cur[first + (t0-2)*nc], cur[first + (t0-1)*nc]);
+    }
+    const float4 w = weights[c];
+    const uint end = min(t0 + 8, uint(args.n_tokens));
+    for (uint t = t0; t < end; ++t) {
+        const ulong i = first + t*nc;
+        const float x = cur[i];
+        const float4 window = float4(past, x);
+        volatile float conv = dot(window, w);
+        dst[i] = args.scale*(x + conv) + args.bias;
+        past = window.yzw;
+    }
+    if (end == uint(args.n_tokens)) {
+        ((device packed_float3 *)(state + gid.z*args.state_stride))[c] = past;
+    }
+}
+
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,

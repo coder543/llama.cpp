@@ -42,11 +42,13 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+    GGML_METAL_FUSION_SSM_CONV_STATE, // convolution, residual and rolling history
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
     GGML_METAL_FUSION_REL_MASK,     // GET_ROWS + ADD + layout conversion to F16
     GGML_METAL_FUSION_CLIP_NORM,    // clip a row to a maximum L2 norm
     GGML_METAL_FUSION_SITU,         // softcapped gate and up projections
     GGML_METAL_FUSION_GATED_RESIDUAL,
+    GGML_METAL_FUSION_CONT_MUL_MAT, // small inner dimension, read the transposed left operand directly
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

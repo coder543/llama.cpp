@@ -2570,19 +2570,30 @@ struct test_get_rows : public test_case {
 };
 
 struct test_relative_mask : public test_get_rows {
-    bool shared, sliced;
-    test_relative_mask(int queries, int streams, bool shared = false, bool sliced = false) :
-        test_get_rows(GGML_TYPE_F32, shared ? 1 : 7, 17, 257, queries, streams), shared(shared), sliced(sliced) {}
+    bool shared, sliced, permuted, flat;
+    test_relative_mask(int queries, int streams, bool shared = false, bool sliced = false, bool permuted = false, bool flat = false) :
+        test_get_rows(GGML_TYPE_F32, shared ? 1 : 7, 17, 257, queries, streams), shared(shared), sliced(sliced), permuted(permuted), flat(flat) {}
     std::string op_desc(ggml_tensor *) override { return "RELATIVE_MASK"; }
-    std::string vars() override { return VARS_TO_STR4(be1, be2, shared, sliced); }
+    std::string vars() override { return VARS_TO_STR6(be1, be2, shared, sliced, permuted, flat); }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, sliced ? 2*n : n, m, be1, be2);
-        if (sliced) {
-            table = ggml_view_4d(ctx, table, n, m, be1, be2, table->nb[1], table->nb[2], table->nb[3], n*table->nb[0]);
+        const int heads = sliced ? 2*n : n;
+        const int queries = flat ? be1*be2 : be1;
+        const int streams = flat ? 1 : be2;
+        auto * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, permuted ? m : heads, permuted ? heads : m, queries, streams);
+        if (permuted) {
+            if (sliced) {
+                table = ggml_view_4d(ctx, table, m, n, queries, streams, table->nb[1], table->nb[2], table->nb[3], n*table->nb[1]);
+            }
+            table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        } else if (sliced) {
+            table = ggml_view_4d(ctx, table, n, m, queries, streams, table->nb[1], table->nb[2], table->nb[3], n*table->nb[0]);
         }
-        auto * ids   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        auto * ids   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, queries, streams);
+        if (queries == 1 && streams > 1) {
+            ids = ggml_view_3d(ctx, ids, r, 1, streams, 2*ids->nb[1], ids->nb[2], 0);
+        }
         auto * bias  = ggml_reshape_4d(ctx, ggml_get_rows(ctx, table, ids), n, r, be1, be2);
         auto * mask  = shared ? bias : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, r, be1, be2);
         auto * sum   = ggml_add(ctx, bias, mask);
@@ -2614,10 +2625,10 @@ struct test_situ : public test_case {
 };
 
 struct test_gated_residual : public test_case {
-    bool broadcast;
-    test_gated_residual(bool broadcast) : broadcast(broadcast) {}
+    bool broadcast, strided;
+    test_gated_residual(bool broadcast, bool strided = false) : broadcast(broadcast), strided(strided) {}
     std::string op_desc(ggml_tensor *) override { return "GATED_RESIDUAL"; }
-    std::string vars() override { return VAR_TO_STR(broadcast); }
+    std::string vars() override { return VARS_TO_STR2(broadcast, strided); }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2625,8 +2636,31 @@ struct test_gated_residual : public test_case {
         auto * forget = ggml_dup_tensor(ctx, cur);
         auto * gain = ggml_dup_tensor(ctx, cur);
         auto * msg = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 257) : ggml_dup_tensor(ctx, cur);
+        if (strided) {
+            auto * packed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*257, 3);
+            cur = ggml_view_2d(ctx, packed, 257, 3, packed->nb[1], 0);
+            msg = ggml_view_2d(ctx, packed, 257, 3, packed->nb[1], 257*packed->nb[0]);
+        }
         auto * keep = ggml_sub(ctx, cur, ggml_mul(ctx, ggml_tanh(ctx, forget), cur));
         return ggml_add(ctx, keep, ggml_mul(ctx, ggml_tanh(ctx, gain), msg));
+    }
+};
+
+struct test_cont_mul_mat : public test_case {
+    int inner;
+    bool shared;
+    test_cont_mul_mat(int inner, bool shared) : inner(inner), shared(shared) {}
+    std::string op_desc(ggml_tensor *) override { return "CONT_MUL_MAT"; }
+    std::string vars() override { return VARS_TO_STR2(inner, shared); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 129, inner, 5);
+        auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, inner, 5, 3);
+        b = ggml_permute(ctx, b, 0, 2, 1, 3);
+        auto * copy = ggml_cont(ctx, ggml_transpose(ctx, a));
+        auto * out = ggml_mul_mat(ctx, copy, b);
+        return shared ? ggml_add(ctx, out, ggml_sum(ctx, copy)) : out;
     }
 };
 
@@ -4962,6 +4996,38 @@ struct test_ssm_conv : public test_case {
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
+    }
+};
+
+struct test_ssm_conv_state : public test_case {
+    int tokens, seqs;
+    bool reuse, alias, shared_weight;
+    test_ssm_conv_state(int tokens, int seqs, bool reuse = false, bool alias = false, bool shared_weight = false) :
+        tokens(tokens), seqs(seqs), reuse(reuse), alias(alias), shared_weight(shared_weight) {}
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_STATE"; }
+    std::string vars() override { return VARS_TO_STR5(tokens, seqs, reuse, alias, shared_weight); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int nc = 33;
+        auto * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, nc + 4, seqs);
+        auto * past = ggml_view_3d(ctx, history, 3, nc, seqs, history->nb[1], history->nb[2], history->nb[1]);
+        auto * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, tokens*seqs);
+        auto * step = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, nc, tokens, seqs));
+        auto * x = ggml_concat(ctx, past, step, 0);
+        auto * w = shared_weight ? x : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, nc);
+        auto * conv = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), nc, tokens*seqs);
+        auto * out = ggml_scale_bias(ctx, ggml_add(ctx, cur, conv), 0.375f, -0.125f);
+        auto * tail = ggml_view_3d(ctx, x, 3, nc, seqs, x->nb[1], x->nb[2], tokens*x->nb[0]);
+        auto * storage = alias ? history : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*nc + 7, seqs);
+        auto * cell = ggml_view_2d(ctx, storage, 3*nc, seqs, alias ? history->nb[2] : storage->nb[1], 2*sizeof(float));
+        auto * store = ggml_cpy(ctx, tail, cell);
+        if (gf) {
+            ggml_build_forward_expand(gf, out);
+            ggml_build_forward_expand(gf, store);
+        }
+        auto * both = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_cont_1d(ctx, store, ggml_nelements(store)), 0);
+        return reuse ? ggml_add(ctx, both, ggml_sum(ctx, x)) : both;
     }
 };
 
@@ -10978,6 +11044,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_relative_mask(3, 2));
     test_cases.emplace_back(new test_relative_mask(3, 1, true));
     test_cases.emplace_back(new test_relative_mask(3, 1, false, true));
+    test_cases.emplace_back(new test_relative_mask(3, 1, false, true, true));
+    test_cases.emplace_back(new test_relative_mask(3, 2, false, true, true));
+    test_cases.emplace_back(new test_relative_mask(3, 2, false, true, true, true));
+    test_cases.emplace_back(new test_relative_mask(1, 3, false, true, true, true));
+    test_cases.emplace_back(new test_relative_mask(1, 3, false, true, true));
+    test_cases.emplace_back(new test_gated_residual(false, true));
+    for (int inner : {1, 5, 9}) {
+        test_cases.emplace_back(new test_cont_mul_mat(inner, false));
+    }
+    test_cases.emplace_back(new test_cont_mul_mat(3, true));
     for (bool value : {false, true}) {
         test_cases.emplace_back(new test_situ(value));
         test_cases.emplace_back(new test_gated_residual(value));
@@ -11948,6 +12024,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int tokens : {1, 2, 3, 8, 9}) {
+        test_cases.emplace_back(new test_ssm_conv_state(tokens, 2));
+    }
+    test_cases.emplace_back(new test_ssm_conv_state(1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(1, 2, false, true));
+    test_cases.emplace_back(new test_ssm_conv_state(1, 1, false, false, true));
     for (int64_t d_conv : {2, 3, 4, 7, 9}) {
         test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, 33, 2, 1}, {d_conv, 33, 1, 1}));
         for (int64_t d_inner: {1024, 1536, 2048}) {

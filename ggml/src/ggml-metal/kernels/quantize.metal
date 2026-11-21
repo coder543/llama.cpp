@@ -296,7 +296,7 @@ kernel void kernel_get_rows_q(
 // Gather the relative bias and add the shared mask in flash attention's [key, query, head] order.
 kernel void kernel_get_rows_f32_rel_mask(
         constant ggml_metal_kargs_rel_mask & args,
-        device const float * table,
+        device const char  * table,
         device const int   * ids,
         device const float * mask,
         device       half  * dst,
@@ -305,8 +305,8 @@ kernel void kernel_get_rows_f32_rel_mask(
         return;
     }
     const ulong row = ulong(gid.y)*args.n_kv + gid.x;
-    const ulong col = ulong(gid.y)*args.n_bucket + ids[row];
-    dst[ulong(gid.z)*args.n_query*args.n_kv + row] = half(table[col*args.table_stride + gid.z] + mask[row]);
+    const float bias = *(device const float *)(table + gid.y*args.nb_query + ids[row]*args.nb_bucket + gid.z*args.nb_head);
+    dst[ulong(gid.z)*args.n_query*args.n_kv + row] = half(bias + mask[row]);
 }
 
 template<typename T0, typename T>

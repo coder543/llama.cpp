@@ -481,8 +481,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_SUCCESS;
     }
 
-    // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    // Give large graphs a longer GPU prefix while the CPU encodes the remaining nodes.
+    const int n_main = MAX(64, gf->n_nodes / (gf->n_nodes > 8192 ? 5 : 10));
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
