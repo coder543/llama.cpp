@@ -9,12 +9,13 @@ kernel void kernel_ssm_conv_f32_f32(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
-    const int64_t i2 = tgpig.y;
-    const int64_t i3 = tgpig.z;
+        uint3 gid [[thread_position_in_grid]]) {
+    const int64_t ir = gid.x;
+    const int64_t i2 = gid.y;
+    const int64_t i3 = gid.z;
+    if (ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;
@@ -40,12 +41,13 @@ kernel void kernel_ssm_conv_f32_f32_4(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
-    const int64_t i2 = tgpig.y;
-    const int64_t i3 = tgpig.z;
+        uint3 gid [[thread_position_in_grid]]) {
+    const int64_t ir = gid.x;
+    const int64_t i2 = gid.y;
+    const int64_t i3 = gid.z;
+    if (ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;

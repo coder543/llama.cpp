@@ -156,8 +156,11 @@ hy_v4               ,0   ,any     ,MUL+ADD                     ,      2
 hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v4               ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      1
+inkling2            ,0   ,any     ,GET_ROWS+ADD+CPY            ,      3
 inkling2            ,0   ,any     ,MUL+ADD                     ,      6
 inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
+inkling2            ,0   ,any     ,SCALE+UNARY+SCALE+UNARY+MUL+SCALE+UNARY+SCALE+MUL,      3
+inkling2            ,0   ,any     ,SQR+SUM_ROWS+SQRT+SCALE+FILL+DIV+CLAMP+MUL,      9
 inkling2            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE,      3
 internlm2           ,0   ,any     ,RMS_NORM+MUL                ,      5
 jais                ,0   ,any     ,NORM+MUL+ADD                ,      5

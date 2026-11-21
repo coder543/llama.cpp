@@ -3775,7 +3775,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
         ggml_tensor * kq_b,
-        ggml_tensor * kq_mask,
+        ggml_tensor * const * masks,
+             size_t   n_masks,
         ggml_tensor * kv_rows,
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
@@ -3846,7 +3847,32 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+    GGML_ASSERT(n_masks > 0);
+    if (n_masks > 1) {
+        GGML_ASSERT(cparams.flash_attn && !kq_b && !kv_rows && !v_mla && sinks);
+        const int64_t gqa = q->ne[1]/k->ne[1];
+        auto heads = [&](ggml_tensor * t, int64_t first, int64_t count) {
+            return ggml_view_4d(ctx0, t, t->ne[0], count, t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], first*t->nb[1]);
+        };
+        int64_t first = 0;
+        for (size_t i = 0; i < n_masks; ++i) {
+            auto * mask = masks[i];
+            const int64_t count = mask->ne[2];
+            GGML_ASSERT(count % gqa == 0 && count <= q->ne[1] - first);
+            auto * qs = heads(q, first, count);
+            auto * ks = heads(k, first/gqa, count/gqa);
+            auto * vs = heads(v, first/gqa, count/gqa);
+            auto * ss = ggml_view_1d(ctx0, sinks, count, first*sinks->nb[0]);
+            auto * out = gctx.build_attn_mha(qs, ks, vs, nullptr, mask, nullptr, ss, nullptr, 0, kq_scale, il);
+            cur = cur ? ggml_concat(ctx0, cur, out, 0) : out;
+            ggml_build_forward_expand(gf, cur);
+            first += count;
+        }
+        GGML_ASSERT(first == q->ne[1]);
+    } else {
+        cur = gctx.build_attn_mha(q, k, v, kq_b, masks[0], kv_rows, sinks, v_mla, 0, kq_scale, il);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -3887,7 +3913,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.raw  : inp->self_attn_mask.raw;
     const auto & kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
 
-    return build_attn_iswa_impl(*this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, kq_mask, kv_rows, sinks, v_mla, kq_scale, il);
+    return build_attn_iswa_impl(*this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, &kq_mask, 1, kv_rows, sinks, v_mla, kq_scale, il);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -4486,7 +4512,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_b,
+        const std::vector<ggml_tensor *> & masks,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
@@ -4500,18 +4526,11 @@ ggml_tensor * llm_graph_context::build_attn(
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    for (auto * mask : masks) {
+        cb(mask, "kq_mask_rel_pos", il);
     }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
-    }
-    cb(kq_mask, "kq_mask_rel_pos", il);
 
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, masks.data(), masks.size(), nullptr, sinks, nullptr, kq_scale, il);
 }
 
 void llm_graph_context::build_dense_out(

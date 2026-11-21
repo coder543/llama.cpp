@@ -1079,6 +1079,26 @@ typedef struct {
 } ggml_metal_kargs_get_rows;
 
 typedef struct {
+    int32_t n_kv;
+    int32_t n_query;
+    int32_t table_stride;
+    int32_t n_bucket;
+} ggml_metal_kargs_rel_mask;
+
+typedef struct {
+    int32_t n4;
+    float eps;
+    float limit;
+} ggml_metal_kargs_clip_norm;
+
+typedef struct {
+    int32_t n_cols;
+    uint64_t gate_stride;
+    uint64_t up_stride;
+    float gate_in, gate_out, up_in, up_out;
+} ggml_metal_kargs_situ;
+
+typedef struct {
     int32_t  nk0;
     int32_t  ne01;
     uint64_t nb01;

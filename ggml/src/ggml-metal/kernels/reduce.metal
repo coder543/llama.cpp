@@ -51,6 +51,21 @@ kernel void kernel_op_sum_f32(
 
 constant short FC_sum_rows_op [[function_constant(FC_SUM_ROWS + 0)]];
 
+kernel void kernel_clip_norm_f32(
+        constant ggml_metal_kargs_clip_norm & args,
+        device const packed_float4 * src,
+        device       packed_float4 * dst,
+        uint row [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const ulong i = ulong(row)*args.n4 + lane;
+    const float4 x = lane < args.n4 ? float4(src[i]) : 0.0f;
+    // Round the square root as in the separate SQRT dispatch.
+    volatile float norm = sqrt(sum(simd_sum(x*x)));
+    if (lane < args.n4) {
+        dst[i] = x*clamp(args.limit/(norm + args.eps), 0.0f, 1.0f);
+    }
+}
+
 template <typename T0, typename T>
 kernel void kernel_sum_rows_impl(
         constant ggml_metal_kargs_sum_rows & args,

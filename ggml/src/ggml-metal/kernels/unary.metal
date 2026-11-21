@@ -21,6 +21,39 @@ inline bfloat4 ggml_metal_unary_cast<bfloat4, float>(float x) {
 }
 #endif
 
+kernel void kernel_gated_residual_f32(
+        constant int & count,
+        device const float * forget,
+        device const float * gain,
+        device const float * cur,
+        device const float * msg,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < uint(count)) {
+        #pragma clang fp contract(off)
+        const float keep = cur[gid] - precise::tanh(forget[gid])*cur[gid];
+        dst[gid] = keep + precise::tanh(gain[gid])*msg[gid];
+    }
+}
+
+kernel void kernel_situ_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const float * gate,
+        device const float * up,
+        device       float * dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(args.n_cols)) {
+        return;
+    }
+    const float g = gate[gid.y*args.gate_stride + gid.x];
+    const float u = up[gid.y*args.up_stride + gid.x];
+    const float gc = args.gate_out*precise::tanh(args.gate_in*g);
+    const float uc = args.up_out*precise::tanh(args.up_in*u);
+    // Round the gated activation before multiplying by the up projection.
+    volatile float act = gc*(1.0f/(1.0f + exp(-g)));
+    dst[ulong(gid.y)*args.n_cols + gid.x] = act*uc;
+}
+
 template <typename T0, typename T, typename TC>
 kernel void kernel_unary_impl(
         constant ggml_metal_kargs_unary & args,

@@ -2569,6 +2569,84 @@ struct test_get_rows : public test_case {
     }
 };
 
+struct test_relative_mask : public test_get_rows {
+    bool shared, sliced;
+    test_relative_mask(int queries, int streams, bool shared = false, bool sliced = false) :
+        test_get_rows(GGML_TYPE_F32, shared ? 1 : 7, 17, 257, queries, streams), shared(shared), sliced(sliced) {}
+    std::string op_desc(ggml_tensor *) override { return "RELATIVE_MASK"; }
+    std::string vars() override { return VARS_TO_STR4(be1, be2, shared, sliced); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, sliced ? 2*n : n, m, be1, be2);
+        if (sliced) {
+            table = ggml_view_4d(ctx, table, n, m, be1, be2, table->nb[1], table->nb[2], table->nb[3], n*table->nb[0]);
+        }
+        auto * ids   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        auto * bias  = ggml_reshape_4d(ctx, ggml_get_rows(ctx, table, ids), n, r, be1, be2);
+        auto * mask  = shared ? bias : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, r, be1, be2);
+        auto * sum   = ggml_add(ctx, bias, mask);
+        return ggml_cast(ctx, ggml_permute(ctx, sum, 2, 0, 1, 3), GGML_TYPE_F16);
+    }
+};
+
+struct test_situ : public test_case {
+    bool packed;
+    test_situ(bool packed) : packed(packed) {}
+    std::string op_desc(ggml_tensor *) override { return "SITU"; }
+    std::string vars() override { return VAR_TO_STR(packed); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n = 257;
+        auto * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, packed ? 2*n : n, 3, 5);
+        ggml_tensor * up;
+        if (packed) {
+            up = ggml_view_3d(ctx, gate, n, 3, 5, gate->nb[1], gate->nb[2], n*gate->nb[0]);
+            gate = ggml_view_3d(ctx, gate, n, 3, 5, gate->nb[1], gate->nb[2], 0);
+        } else {
+            up = ggml_dup_tensor(ctx, gate);
+        }
+        auto * g = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 0.25f)), 4.0f);
+        auto * u = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/25.0f)), 25.0f);
+        return ggml_mul(ctx, ggml_mul(ctx, g, ggml_sigmoid(ctx, gate)), u);
+    }
+};
+
+struct test_gated_residual : public test_case {
+    bool broadcast;
+    test_gated_residual(bool broadcast) : broadcast(broadcast) {}
+    std::string op_desc(ggml_tensor *) override { return "GATED_RESIDUAL"; }
+    std::string vars() override { return VAR_TO_STR(broadcast); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 3);
+        auto * forget = ggml_dup_tensor(ctx, cur);
+        auto * gain = ggml_dup_tensor(ctx, cur);
+        auto * msg = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 257) : ggml_dup_tensor(ctx, cur);
+        auto * keep = ggml_sub(ctx, cur, ggml_mul(ctx, ggml_tanh(ctx, forget), cur));
+        return ggml_add(ctx, keep, ggml_mul(ctx, ggml_tanh(ctx, gain), msg));
+    }
+};
+
+struct test_clip_norm : public test_case {
+    int cols;
+    float limit;
+    test_clip_norm(int cols, float limit) : cols(cols), limit(limit) {}
+    std::string op_desc(ggml_tensor *) override { return "CLIP_NORM"; }
+    std::string vars() override { return VARS_TO_STR2(cols, limit); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, 5, 3);
+        auto * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        auto * ratio = ggml_div(ctx, ggml_fill(ctx, norm, limit), norm);
+        return ggml_mul(ctx, x, ggml_clamp(ctx, ratio, 0.0f, 1.0f));
+    }
+};
+
 // GGML_OP_GET_ROWS on a weight also used by GGML_OP_MUL_MAT (tied embeddings)
 // that the preceding mul_mat may have put in the SYCL reorder layout. The
 // mul_mat runs first, so a backend that changes the weight layout in place
@@ -10895,6 +10973,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_relative_mask(1, 1));
+    test_cases.emplace_back(new test_relative_mask(3, 1));
+    test_cases.emplace_back(new test_relative_mask(3, 2));
+    test_cases.emplace_back(new test_relative_mask(3, 1, true));
+    test_cases.emplace_back(new test_relative_mask(3, 1, false, true));
+    for (bool value : {false, true}) {
+        test_cases.emplace_back(new test_situ(value));
+        test_cases.emplace_back(new test_gated_residual(value));
+    }
+    for (int cols : {16, 128, 129}) {
+        for (float limit : {0.5f, 32.0f}) {
+            test_cases.emplace_back(new test_clip_norm(cols, limit));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
@@ -11857,6 +11949,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t d_conv : {2, 3, 4, 7, 9}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, 33, 2, 1}, {d_conv, 33, 1, 1}));
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));

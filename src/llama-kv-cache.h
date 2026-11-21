@@ -417,6 +417,7 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    uint32_t get_size() const;
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
 
