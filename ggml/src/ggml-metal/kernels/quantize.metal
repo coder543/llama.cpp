@@ -309,6 +309,44 @@ kernel void kernel_get_rows_f32_rel_mask(
     dst[ulong(gid.z)*args.n_query*args.n_kv + row] = half(bias + mask[row]);
 }
 
+kernel void kernel_project_f32_rel_mask(
+        constant ggml_metal_kargs_rel_mask & args,
+        device const char  * basis,
+        device const int   * ids,
+        device const float * mask,
+        device       half  * dst,
+        device const char  * features,
+        device const char  * sinks,
+        uint3 gid [[thread_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort lanes [[threads_per_simdgroup]]) {
+    device const float * b = (device const float *)(features + gid.y*args.nb_query + gid.z*args.nb_head);
+    device const float * tail = (device const float *)(basis + args.last_bucket*args.nb_bucket);
+    // Distant keys can share a zero row. Check the features too because zero times infinity is NaN.
+    bool zero = true;
+    for (ushort i = lane; i < 16; i += lanes) {
+        zero = zero && (as_type<uint>(tail[i]) & 0x7fffffffu) == 0 && (as_type<uint>(b[i]) & 0x7f800000u) != 0x7f800000u;
+    }
+    zero = simd_all(zero);
+    if (gid.x >= uint(args.n_kv)) {
+        return;
+    }
+    const ulong row = ulong(gid.y)*args.n_kv + gid.x;
+    const int bucket = ids[row];
+    const float sink = ((device const float *)(sinks + gid.y*args.nb_sink))[gid.z];
+    float sum = 0.0f;
+    if (bucket != args.last_bucket || !zero) {
+        device const float * a = (device const float *)(basis + bucket*args.nb_bucket);
+        for (short i = 0; i < 16; ++i) {
+            sum += a[i]*b[i];
+        }
+    }
+    // Round the projection and subtraction separately, as in the unfused graph.
+    volatile float projected = sum;
+    volatile float bias = projected - sink;
+    dst[ulong(gid.z)*args.n_query*args.n_kv + row] = half(bias + mask[row]);
+}
+
 template<typename T0, typename T>
 kernel void kernel_get_rows_f(
         constant ggml_metal_kargs_get_rows & args,

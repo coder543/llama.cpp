@@ -2601,6 +2601,45 @@ struct test_relative_mask : public test_get_rows {
     }
 };
 
+struct test_projected_relative_mask : public test_get_rows {
+    int width;
+    bool padded, shared, inplace;
+
+    test_projected_relative_mask(int queries, int streams, int width, bool padded, bool shared, bool inplace = false) :
+        test_get_rows(GGML_TYPE_F32, 3, 17, 67, queries, streams), width(width), padded(padded), shared(shared), inplace(inplace) {}
+    std::string op_desc(ggml_tensor *) override { return "PROJECTED_RELATIVE_MASK"; }
+    std::string vars() override { return VARS_TO_STR6(be1, be2, width, padded, shared, inplace); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * basis = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, m - padded);
+        if (padded) {
+            basis = ggml_pad(ctx, basis, 0, 1, 0, 0);
+            if (inplace && gf) {
+                auto * tail = ggml_view_1d(ctx, basis, width, (m - 1)*basis->nb[1]);
+                auto * values = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, values, tail));
+            }
+        }
+        auto * features = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n*be1*be2);
+        auto * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n + 2, be1*be2);
+        auto * sink = ggml_view_3d(ctx, storage, 1, n, be1*be2, storage->nb[0], storage->nb[1], sizeof(float));
+        auto * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r, be1*be2);
+        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, r, be1, be2);
+        if (gf) {
+            ggml_build_forward_expand(gf, sink);
+        }
+        auto * mm = ggml_mul_mat(ctx, basis, features);
+        auto * table = ggml_reshape_3d(ctx, mm, m, n, be1*be2);
+        table = inplace ? ggml_sub_inplace(ctx, table, sink) : ggml_sub(ctx, table, sink);
+        auto * values = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        auto * bias = ggml_reshape_4d(ctx, ggml_get_rows(ctx, values, ids), n, r, be1, be2);
+        bias = inplace ? ggml_add_inplace(ctx, bias, mask) : ggml_add(ctx, bias, mask);
+        auto * out = ggml_cast(ctx, ggml_permute(ctx, bias, 2, 0, 1, 3), GGML_TYPE_F16);
+        return shared ? ggml_add(ctx, ggml_cast(ctx, out, GGML_TYPE_F32), ggml_sum(ctx, mm)) : out;
+    }
+};
+
 struct test_situ : public test_case {
     bool packed;
     test_situ(bool packed) : packed(packed) {}
@@ -11049,6 +11088,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_relative_mask(3, 2, false, true, true, true));
     test_cases.emplace_back(new test_relative_mask(1, 3, false, true, true, true));
     test_cases.emplace_back(new test_relative_mask(1, 3, false, true, true));
+    test_cases.emplace_back(new test_projected_relative_mask(1, 1, 16, true, false));
+    test_cases.emplace_back(new test_projected_relative_mask(5, 2, 16, true, false));
+    test_cases.emplace_back(new test_projected_relative_mask(3, 1, 16, false, false));
+    test_cases.emplace_back(new test_projected_relative_mask(3, 1, 16, true, true));
+    test_cases.emplace_back(new test_projected_relative_mask(3, 1, 17, true, false));
+    test_cases.emplace_back(new test_projected_relative_mask(3, 2, 16, true, false, true));
     test_cases.emplace_back(new test_gated_residual(false, true));
     for (int inner : {1, 5, 9}) {
         test_cases.emplace_back(new test_cont_mul_mat(inner, false));
@@ -12732,6 +12777,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // n_used == n_mats, so every expert can be skipped
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
+
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 8, true, 1024, 257, 1024, 1088, true, true));
+    test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 8, false, 1024, 257, 1024, 1088, true));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
 
     for (int bs : {1, 4, 512}) {
@@ -13428,6 +13476,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 256, 65, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, false, 0, 0, 24));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));

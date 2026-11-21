@@ -135,7 +135,7 @@
 #define OP_FLASH_ATTN_EXT_NCPSG 64
 
 #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
-#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_SMALL 16
 #define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
 #define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
 
@@ -1090,9 +1090,11 @@ typedef struct {
 typedef struct {
     int32_t n_kv;
     int32_t n_query;
+    int32_t last_bucket;
     uint64_t nb_head;
     uint64_t nb_bucket;
     uint64_t nb_query;
+    uint64_t nb_sink;
 } ggml_metal_kargs_rel_mask;
 
 typedef struct {

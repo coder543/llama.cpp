@@ -292,6 +292,8 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
+                const auto * props = ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context);
+                res += ggml_metal_op_mul_mat_id_extra_packed(tensor, props, res);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -324,8 +326,6 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
     }
 
     return res;
-
-    GGML_UNUSED(buft);
 }
 
 // default (shared) buffer type

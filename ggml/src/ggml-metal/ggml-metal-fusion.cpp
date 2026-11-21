@@ -983,25 +983,26 @@ static bool ggml_metal_fusion_check_cont_mul_mat(
 static bool ggml_metal_fusion_check_rel_mask(
         const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes,
         const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
-    const bool copy = nodes[0]->op == GGML_OP_CONT;
+    const bool project = nodes[0]->op == GGML_OP_MUL_MAT;
+    const int gather_idx = (int) fusion->ops.size() - 3;
     const int start = node_idxs[idx];
-    const int first = node_idxs[idx + copy];
-    const int last  = node_idxs[idx + copy + 2];
-    if (first != start + copy || last != first + 4 || node_idxs[idx + copy + 1] != first + 2 ||
-        !ggml_can_fuse_subgraph(gf, start, 5 + copy, fusion->ops_all.data(), &last, 1)) {
+    const int first = node_idxs[idx + gather_idx];
+    const int last  = node_idxs[idx + gather_idx + 2];
+    if (last - start + 1 != (int) fusion->ops_all.size() || last != first + 4 || node_idxs[idx + gather_idx + 1] != first + 2 ||
+        !ggml_can_fuse_subgraph(gf, start, last - start + 1, fusion->ops_all.data(), &last, 1)) {
         return false;
     }
 
-    const auto * gather  = nodes[copy];
+    const auto * gather  = nodes[gather_idx];
     const auto * reshape = gf->nodes[first + 1];
-    const auto * add     = nodes[copy + 1];
+    const auto * add     = nodes[gather_idx + 1];
     const auto * perm    = gf->nodes[first + 3];
-    const auto * dst     = nodes[copy + 2];
+    const auto * dst     = nodes[gather_idx + 2];
     const auto * table   = gather->src[0];
     const auto * ids     = gather->src[1];
     const auto * mask    = add->src[1];
-    if (copy) {
-        if (table != nodes[0] || !ggml_are_same_shape(table, table->src[0]) || mask == table || mask->view_src == table) {
+    if (gather_idx > 0) {
+        if (table != nodes[gather_idx - 1] || !ggml_are_same_shape(table, table->src[0]) || mask == table || mask->view_src == table) {
             return false;
         }
         table = table->src[0];
@@ -1009,7 +1010,7 @@ static bool ggml_metal_fusion_check_rel_mask(
         return false;
     }
     if (reshape->src[0] != gather ||
-        add->src[0] != reshape || add->view_src || mask == gather || mask->view_src == gather || perm->src[0] != add ||
+        add->src[0] != reshape || (add->view_src && add->view_src != gather) || mask == gather || mask->view_src == gather || perm->src[0] != add ||
         dst->src[0] != perm || dst->src[1] != dst || !ggml_are_same_shape(perm, dst) ||
         table->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F16 ||
         !ggml_is_contiguous(ids) || !ggml_is_contiguous(dst)) {
@@ -1017,7 +1018,7 @@ static bool ggml_metal_fusion_check_rel_mask(
     }
 
     const int64_t keys = ids->ne[0], queries = dst->ne[1], heads = table->ne[0], streams = dst->ne[3];
-    if (keys > INT32_MAX || queries > INT32_MAX || heads > INT32_MAX || streams > INT32_MAX || table->ne[1] > INT32_MAX ||
+    if (keys > INT32_MAX || queries > INT32_MAX || heads < 1 || heads > INT32_MAX || streams > INT32_MAX || table->ne[1] > INT32_MAX ||
         !ggml_is_3d(ids) || !((ids->ne[1] == queries*streams && ids->ne[2] == 1) || (ids->ne[1] == queries && ids->ne[2] == streams)) ||
         table->ne[2] != ids->ne[1] || table->ne[3] != ids->ne[2] || dst->ne[0] != keys || dst->ne[2] != heads ||
         reshape->ne[0] != heads || reshape->ne[1] != keys || reshape->ne[2] != queries || reshape->ne[3] != streams ||
@@ -1027,6 +1028,36 @@ static bool ggml_metal_fusion_check_rel_mask(
         return false;
     }
 
+    if (project) {
+        const auto * mm = nodes[0];
+        const auto * sub = nodes[1];
+        const auto * basis = mm->src[0];
+        const auto * features = mm->src[1];
+        const auto * sink = sub->src[1];
+        if (sub->src[0] != gf->nodes[start + 1] || sub->src[0]->src[0] != mm || (sub->view_src && sub->view_src != mm) ||
+            table->op != GGML_OP_PERMUTE || table->src[0] != sub || !ggml_is_matrix(ids) ||
+            !ggml_is_matrix(basis) || !ggml_is_matrix(features) || basis->ne[0] != 16 || basis->ne[1] < 1 || basis->ne[1] != table->ne[1] ||
+            !ggml_is_contiguous(basis) || !ggml_is_contiguous(features) || features->ne[1] % heads || features->ne[1]/heads != ids->ne[1] ||
+            basis->type != GGML_TYPE_F32 || features->type != GGML_TYPE_F32 || sink->type != GGML_TYPE_F32 ||
+            sub->ne[0] != basis->ne[1] || sub->ne[1] != heads || sub->ne[2] != ids->ne[1] || !ggml_is_3d(sub) ||
+            table->nb[0] != sub->nb[1] || table->nb[1] != sub->nb[0] || table->nb[2] != sub->nb[2] ||
+            sink->ne[0] != 1 || sink->ne[1] != heads || sink->ne[2] != ids->ne[1] || !ggml_is_3d(sink) || sink->nb[1] != sizeof(float) ||
+            sink == mm || sink->view_src == mm || ggml_get_op_params_i32(mm, 1) != GGML_HINT_NONE ||
+            ggml_prec_get_acc(mm) != GGML_PREC_UNDEFINED || ggml_prec_get_src(mm, 1) != GGML_PREC_UNDEFINED) {
+            return false;
+        }
+        for (const auto * src : { basis, features, sink, ids, mask }) {
+            for (int i = start; i < last; ++i) {
+                if (src == gf->nodes[i] || src->view_src == gf->nodes[i]) {
+                    return false;
+                }
+            }
+            if (mode == GGML_METAL_FUSION_FULL && ggml_metal_fusion_overlap(dst, src)) {
+                return false;
+            }
+        }
+        return true;
+    }
     return mode == GGML_METAL_FUSION_STRUCTURAL || (!ggml_metal_fusion_overlap(dst, table) &&
            !ggml_metal_fusion_overlap(dst, ids) && !ggml_metal_fusion_overlap(dst, mask));
 }
@@ -1086,6 +1117,10 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_cont_mul_mat = { GGML_OP_CONT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_rel_mask_cont = { GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_rel_mask_project = {
+    GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
+    GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CPY,
+};
 static const std::vector<ggml_op> ops_rel_mask = { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_clip_norm = {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
@@ -1149,7 +1184,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_CONT_MUL_MAT, ops_cont_mul_mat, {}, true, ggml_metal_fusion_check_cont_mul_mat },
-    { GGML_METAL_FUSION_REL_MASK, ops_rel_mask_cont, {}, true, ggml_metal_fusion_check_rel_mask },
+    { GGML_METAL_FUSION_REL_MASK, ops_rel_mask_project, {}, true, ggml_metal_fusion_check_rel_mask },
+    { GGML_METAL_FUSION_REL_MASK, ops_rel_mask_cont,    {}, true, ggml_metal_fusion_check_rel_mask },
     { GGML_METAL_FUSION_REL_MASK, ops_rel_mask, {}, true, ggml_metal_fusion_check_rel_mask },
     { GGML_METAL_FUSION_CLIP_NORM, ops_clip_norm, {}, true, ggml_metal_fusion_check_clip_norm },
     { GGML_METAL_FUSION_SITU, ops_situ, {}, true, ggml_metal_fusion_check_situ },

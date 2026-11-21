@@ -544,6 +544,114 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+#ifdef GGML_METAL_HAS_TENSOR
+kernel void kernel_mul_mm_id_pack_f32(
+        constant ggml_metal_kargs_mul_mm_id & args,
+        device const char * src,
+        device const uint * tiles,
+        device const int  * ids,
+        device      half4 * dst,
+        uint3 gid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint tile = gid.y;
+    if (tile >= tiles[0] || gid.x >= tiles[3 + 3*tile]) {
+        return;
+    }
+    const uint row = tiles[2 + 3*tile] + gid.x;
+    const int id = ids[row];
+    const int token = id/args.ne20;
+    const int slot  = (id%args.ne20)%args.ne11;
+    device const packed_float4 * x = (device const packed_float4 *)(src + token*args.nb12 + slot*args.nb11);
+    dst += ulong(row)*(args.ne00/4);
+    for (uint i = tid; i < uint(args.ne00/4); i += ntg.x) {
+        dst[i] = half4(x[i]);
+    }
+}
+
+// Each entry tile reads consecutive F16 activations from the prepass.
+kernel void kernel_mul_mm_id_iq4_nl_packed_f32(
+        constant ggml_metal_kargs_mul_mm_id & args,
+        device const char * weights,
+        device       half * packed,
+        device const uint * tiles,
+        device const int  * ids,
+        device      float * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 gid   [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (gid.x >= tiles[0]) {
+        return;
+    }
+    constexpr short M = 64, N = 16, K = 32;
+    const uint expert = tiles[1 + 3*gid.x];
+    const uint first  = tiles[2 + 3*gid.x];
+    const uint count  = tiles[3 + 3*gid.x];
+    const uint row    = M*gid.y;
+    weights += expert*args.nb02 + row*args.nb01;
+    packed  += ulong(first)*args.ne00;
+
+    threadgroup half * sa = (threadgroup half *) shmem;
+    auto a = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(K, M));
+    const auto stride = array<int, 2>({1, args.ne00});
+    auto b = tensor(packed, dextents<int32_t, 2>(K, N), stride);
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(N, M, K, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<2>> mm;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(N, M, K, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<2>> init;
+    auto lo = mm.get_destination_cooperative_tensor<decltype(b), decltype(a), float>();
+    auto hi = mm.get_destination_cooperative_tensor<decltype(b), decltype(a), float>();
+
+    for (int k = 0; k < args.ne00; k += K) {
+        FOR_UNROLL (short j = 0; j < 2; ++j) {
+            const short chunk = tid + M*j;
+            device const block_iq4_nl * w = (device const block_iq4_nl *)(weights + (chunk/2)*args.nb01);
+            half4x4 value;
+            dequantize_iq4_nl(w + k/K, chunk%2, value);
+            ((threadgroup half4x4 *) sa)[chunk] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto ba = tensor(packed + k, dextents<int32_t, 2>(K, min(count, uint(N))), stride);
+        auto aa = a.slice(0, 0);
+        if (k == 0) {
+            init.run(ba, aa, lo);
+        } else {
+            mm.run(ba, aa, lo);
+        }
+        if (count > N) {
+            auto bb = tensor(packed + ulong(N)*args.ne00 + k, dextents<int32_t, 2>(K, count - N), stride);
+            if (k == 0) {
+                init.run(bb, aa, hi);
+            } else {
+                mm.run(bb, aa, hi);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float * sc = (threadgroup float *) shmem;
+    auto c = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(M, 2*N));
+    auto ca = c.slice(0, 0);
+    lo.store(ca);
+    if (count > N) {
+        auto cb = c.slice(0, N);
+        hi.store(cb);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = sg; j < count; j += 2) {
+        const int id = ids[first + j];
+        device float4 * out = (device float4 *)(dst + row + ulong(id%args.ne20)*args.ne0 + ulong(id/args.ne20)*args.ne0*args.ne1);
+        if (lane < M/4) {
+            out[lane] = ((threadgroup float4 *)(sc + j*M))[lane];
+        }
+    }
+}
+#endif
+
 // TODO: refactor into two seperate functions to avoid ifdef branching: with and without tensor support
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
@@ -751,17 +859,7 @@ kernel void kernel_mul_mm_id(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            FOR_UNROLL (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
-
-                const short lx = i%8;
-                const short ly = (tiitg/NL0)%8;
-                //const short lx = (tiitg/NL0)%8;
-                //const short ly = i%8;
-
-                *(sa + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
-            }
+            *(threadgroup S0_4x4 *)(sa + NK*(tiitg/NL0) + 16*il0) = temp_a;
         }
 
         if (FC_mul_mm_bc_inp) {

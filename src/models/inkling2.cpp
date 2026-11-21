@@ -200,11 +200,12 @@ ggml_tensor * llama_model_inkling2::graph::mix(ggml_tensor * blocks, ggml_tensor
     return mix(build_mix_bank(blocks, cur), query);
 }
 
-std::vector<ggml_tensor *> llama_model_inkling2::graph::build_relative_masks(ggml_tensor * table, int il) {
+std::vector<ggml_tensor *> llama_model_inkling2::graph::build_relative_masks(ggml_tensor * basis, ggml_tensor * features, ggml_tensor * sinks, int il) {
     const bool swa = hparams.is_swa(il);
     auto * ids  = swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
     auto * mask = rel_mask[swa];
-    const int64_t n_head = table->ne[1];
+    const int64_t n_head = features->ne[1];
+    const int64_t width = features->ne[0];
     const int64_t gqa = n_head/hparams.n_head_kv(il);
 
     // Use whole KV head groups and keep the same graph topology for prefill and decode.
@@ -221,14 +222,23 @@ std::vector<ggml_tensor *> llama_model_inkling2::graph::build_relative_masks(ggm
     std::vector<ggml_tensor *> masks;
     for (int64_t head = 0; head < n_head; head += tile) {
         const int64_t count = std::min(tile, n_head - head);
-        auto * values = table;
+        auto * rel = features;
+        auto * sink = ggml_view_3d(ctx0, sinks, 1, count, n_tokens, sinks->nb[0], sinks->nb[1], head*sinks->nb[0]);
+        ggml_build_forward_expand(gf, sink);
         if (count < n_head) {
-            values = ggml_view_3d(ctx0, table, table->ne[0], count, n_tokens, table->nb[1], table->nb[2], head*table->nb[1]);
+            rel = ggml_view_3d(ctx0, rel, width, count, n_tokens, rel->nb[1], rel->nb[2], head*rel->nb[1]);
+            rel = ggml_cont_2d(ctx0, rel, width, count*n_tokens);
+        } else {
+            rel = ggml_reshape_2d(ctx0, rel, width, count*n_tokens);
         }
+        auto * values = ggml_mul_mat(ctx0, basis, rel);
+        values = ggml_reshape_3d(ctx0, values, basis->ne[1], count, n_tokens);
+        // Subtract the per-query sink so flash attention can use a zero sink.
+        values = cparams.training ? ggml_sub(ctx0, values, sink) : ggml_sub_inplace(ctx0, values, sink);
         values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));
         auto * bias = ggml_get_rows(ctx0, values, ids);
         bias = ggml_reshape_4d(ctx0, bias, count, ids->ne[0], mask->ne[2], mask->ne[3]);
-        bias = ggml_add(ctx0, bias, mask);
+        bias = cparams.training ? ggml_add(ctx0, bias, mask) : ggml_add_inplace(ctx0, bias, mask);
         bias = ggml_permute(ctx0, bias, 2, 0, 1, 3);
         masks.push_back(cparams.flash_attn ? ggml_cast(ctx0, bias, GGML_TYPE_F16) : ggml_cont(ctx0, bias));
     }
@@ -310,7 +320,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     for (int i = 0; i < 2; ++i) {
         auto * mask = i ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
         mask = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
-        rel_mask[i] = ggml_permute(ctx0, mask, 1, 2, 0, 3);
+        rel_mask[i] = ggml_reshape_4d(ctx0, mask, 1, mask->ne[0], mask->ne[1], mask->ne[3]);
     }
     padded_rel_bias.resize(model.layers.size());
 
@@ -417,16 +427,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (!padded_rel_bias[ip]) {
             padded_rel_bias[ip] = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         }
-        auto * rel = ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens);
-        ggml_tensor * table = ggml_mul_mat(ctx0, padded_rel_bias[ip], rel);
-        table = ggml_reshape_3d(ctx0, table, table->ne[0], n_head, n_tokens);
-
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         if (!zero_sinks || zero_sinks->ne[0] != n_head) {
             zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
         }
-        const auto masks = build_relative_masks(table, il);
+        const auto masks = build_relative_masks(padded_rel_bias[ip], Rcur, sinks, il);
         cur = build_attn(inp, nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, masks, zero_sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
